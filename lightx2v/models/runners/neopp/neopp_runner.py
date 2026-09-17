@@ -11,13 +11,13 @@ from lightx2v.models.networks.neopp.model import NeoppModel
 from lightx2v.models.runners.default_runner import DefaultRunner
 from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.schedulers.neopp.scheduler import NeoppMoeScheduler
+from lightx2v.rl.sde import SdeRolloutConfig
 from lightx2v.utils.envs import *
 from lightx2v.utils.input_info import NeoppInputInfo
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import *
 from lightx2v_platform.base.global_var import AI_DEVICE
-from lightx2v.rl.sde import SdeRolloutConfig, SdeTrace
 
 
 def build_neopp_model_with_lora(neopp_module, config, model_kwargs, lora_configs):

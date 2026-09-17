@@ -40,16 +40,12 @@ class NeoPPSdeTest(unittest.TestCase):
             velocity = torch.full_like(sample, 0.1 * (index + 1))
             sample = state.advance(sample, velocity, timesteps[index], timesteps[index + 1], index)
         trace = state.finish(sample)
-        for next_sample, mean, scale, old_log_prob in zip(
-            trace.next_samples, trace.old_means, trace.scales, trace.old_log_probs
-        ):
+        for next_sample, mean, scale, old_log_prob in zip(trace.next_samples, trace.old_means, trace.scales, trace.old_log_probs):
             torch.testing.assert_close(recompute_log_prob(next_sample, mean, scale), old_log_prob)
 
     def test_trace_store_ttl_and_delete(self):
         timesteps = torch.linspace(0, 1, 3)
-        state = HybridSdeState(
-            SdeRolloutConfig(indices=(0,)), timesteps, seed=1, device=torch.device("cpu")
-        )
+        state = HybridSdeState(SdeRolloutConfig(indices=(0,)), timesteps, seed=1, device=torch.device("cpu"))
         sample = torch.randn(1, 2, 3)
         sample = state.advance(sample, torch.zeros_like(sample), timesteps[0], timesteps[1], 0)
         sample = state.advance(sample, torch.zeros_like(sample), timesteps[1], timesteps[2], 1)

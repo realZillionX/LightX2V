@@ -25,10 +25,7 @@ def select_sde_indices(total_steps: int, window_start: int, window_end: int, sel
         raise ValueError("selected SDE step count exceeds its window")
     if selected_steps == 1:
         return (window_start,)
-    result = tuple(
-        window_start + (position * (width - 1)) // (selected_steps - 1)
-        for position in range(selected_steps)
-    )
+    result = tuple(window_start + (position * (width - 1)) // (selected_steps - 1) for position in range(selected_steps))
     if len(set(result)) != selected_steps:
         raise RuntimeError("SDE window selection produced duplicate steps")
     return result
@@ -125,10 +122,7 @@ def transition(
     sigma_max_tensor = sample.new_tensor(float(sigma_max))
     std = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max_tensor, sigma)))
     std = std * float(noise_level)
-    mean = (
-        sample * (1 + std.square() / (2 * sigma) * dt)
-        + model_output * (1 + std.square() * (1 - sigma) / (2 * sigma)) * dt
-    )
+    mean = sample * (1 + std.square() / (2 * sigma) * dt) + model_output * (1 + std.square() * (1 - sigma) / (2 * sigma)) * dt
     return mean, std * torch.sqrt(-dt)
 
 

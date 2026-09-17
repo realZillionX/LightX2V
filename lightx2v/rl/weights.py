@@ -33,10 +33,7 @@ def closure(model) -> dict[str, dict[str, object]]:
     model.  The data plane never reads live weights back to CPU.
     """
 
-    return {
-        name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
-        for name, tensor in sorted(model_state(model).items())
-    }
+    return {name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)} for name, tensor in sorted(model_state(model).items())}
 
 
 def update_weights(model, tensors: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]], strict: bool = False) -> dict[str, object]:

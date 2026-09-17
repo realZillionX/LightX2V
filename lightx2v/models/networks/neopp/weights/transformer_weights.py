@@ -204,7 +204,6 @@ class NeoppSparseMoeWeights(WeightModule):
             ),
         )
 
-
     @staticmethod
     def _loaded_weight(module, name):
         if module.weight is not None:

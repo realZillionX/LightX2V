@@ -9,12 +9,11 @@ import torch
 from loguru import logger
 
 from lightx2v.models.runners.runner_factory import build_runner
-from lightx2v.utils.set_config import build_startup_config, init_parallel
-from lightx2v.utils.utils import validate_config_paths
 from lightx2v.rl.sde import SdeRolloutConfig
 from lightx2v.rl.weights import closure as weight_closure
 from lightx2v.rl.weights import update_weights as update_model_weights
-from lightx2v.utils.utils import seed_all
+from lightx2v.utils.set_config import build_startup_config, init_parallel
+from lightx2v.utils.utils import seed_all, validate_config_paths
 from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 
 
@@ -461,18 +460,26 @@ class LightX2VPipeline:
 
     @torch.no_grad()
     def generate_rl(
-        self, *, rl_config, seed=42,
-        save_result_path="lightx2v_gen_result.png", task=None,
+        self,
+        *,
+        rl_config,
+        seed=42,
+        save_result_path="lightx2v_gen_result.png",
+        task=None,
         target_shape=None,
     ):
         """Generate a NeoPP action through the request API and retain its SDE trace."""
         if self.model_cls != "neopp":
             raise ValueError("RL image traces are currently supported only by NeoPP")
         config = rl_config if isinstance(rl_config, SdeRolloutConfig) else SdeRolloutConfig(**rl_config)
-        request = self.runner.prepare_request({
-            "task": task or self.task, "seed": seed,
-            "save_result_path": save_result_path, "size": target_shape,
-        })
+        request = self.runner.prepare_request(
+            {
+                "task": task or self.task,
+                "seed": seed,
+                "save_result_path": save_result_path,
+                "size": target_shape,
+            }
+        )
         if request.seed is not None:
             seed_all(request.seed)
         return self.runner.run_pipeline_rl(request, config)

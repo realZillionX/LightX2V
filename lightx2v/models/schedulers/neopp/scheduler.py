@@ -5,9 +5,8 @@ import torch
 from loguru import logger
 
 from lightx2v.models.schedulers.scheduler import BaseScheduler
-from lightx2v_platform.base.global_var import AI_DEVICE
-
 from lightx2v.rl.sde import HybridSdeState, SdeRolloutConfig, SdeTrace
+from lightx2v_platform.base.global_var import AI_DEVICE
 
 
 class NeoppMoeScheduler(BaseScheduler):
