@@ -310,6 +310,21 @@ We provide multiple frontend interface deployment options:
 - [Service Deployment](https://lightx2v-en.readthedocs.io/en/latest/deploy_guides/deploy_service.html) - Production API service deployment
 - [Lora Model Deployment](https://lightx2v-en.readthedocs.io/en/latest/deploy_guides/lora_deploy.html) - Flexible Lora deployment
 
+## Development checks
+
+[CI](.github/workflows/lint.yml) runs lint and the RL CPU regression suite on
+`main` pushes, pull requests, and manual dispatch. The workflow defines the
+Python 3.12 / CPU Torch 2.8 test dependencies. With those dependencies installed:
+
+```bash
+pre-commit run --all-files
+SKIP_PLATFORM_CHECK=True python -m pytest -q tests/rl
+```
+
+The CPU suite checks SDE likelihoods, trace storage, pixel-head math, and online
+weight-publication state without model checkpoints or CUDA kernels. GPU inference
+and training still require their production runtime validation.
+
 ## 🤝 Acknowledgments
 
 We sincerely thank all the model repositories and research communities that inspired and promoted the development of LightX2V. This framework is built on the collective efforts of the open-source community. It includes but is not limited to:
