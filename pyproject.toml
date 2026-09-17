@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lightx2v"
-version = "0.1.0"
+version = "0.5.0"
 authors = [
     {name = "LightX2V Contributors"},
 ]
@@ -33,9 +33,9 @@ classifiers = [
 dependencies = [
     "numpy",
     "scipy",
-    "torch<=2.8.0",
-    "torchvision<=0.23.0",
-    "torchaudio<=2.8.0",
+    "torch",
+    "torchvision",
+    "torchaudio",
     "diffusers",
     "transformers",
     "tokenizers",
@@ -47,7 +47,11 @@ dependencies = [
     "imageio-ffmpeg",
     "einops",
     "loguru",
+    "omegaconf",
+    "peft",
+    "swanlab",
     "qtorch",
+    "comfy-kitchen>=0.2.15",
     "ftfy",
     "gradio",
     "aiohttp",
@@ -65,7 +69,7 @@ dependencies = [
     "redis==6.4.0",
     "tos",
     "decord",
-    "av",
+    "av>=17",
     "torchada>=0.1.10",
 ]
 

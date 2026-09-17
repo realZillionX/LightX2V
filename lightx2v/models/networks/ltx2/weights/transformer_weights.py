@@ -1,3 +1,4 @@
+import torch
 import torch.distributed as dist
 
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
@@ -5,8 +6,14 @@ from lightx2v.utils.registry_factory import (
     ATTN_WEIGHT_REGISTER,
     MM_WEIGHT_REGISTER,
     RMS_WEIGHT_REGISTER,
+    ROPE_REGISTER,
     TENSOR_REGISTER,
 )
+
+
+def _make_ltx_rope(config):
+    rope_type = config.get("rope_type", "torch_real_rope")
+    return ROPE_REGISTER[rope_type](layout="split_half", compute_dtype=torch.float32)
 
 
 class LTX2TransformerWeights(WeightModule):
@@ -88,6 +95,20 @@ class LTX2TransformerBlock(WeightModule):
         self.cross_attention_adaln = config.get("cross_attention_adaln", False)
         block_prefix = "transformer_blocks"
         model_prefix = "model.diffusion_model"
+
+        # LTX2 block pre-normalization is an affine-free RMSNorm. Register it
+        # with the weight tree (like Qwen Image's affine-free norms) so the
+        # implementation is selected consistently by rms_norm_type.
+        self.add_module(
+            "norm",
+            RMS_WEIGHT_REGISTER[config.get("rms_norm_type", "sgl-kernel")](
+                weight_name=None,
+                create_cuda_buffer=create_cuda_buffer,
+                create_cpu_buffer=create_cpu_buffer,
+                lazy_load=self.lazy_load,
+                lazy_load_file=self.lazy_load_file,
+            ),
+        )
 
         # Video scale-shift table
         self.scale_shift_table = TENSOR_REGISTER["Default"](
@@ -329,6 +350,10 @@ class LTX2Attention(WeightModule):
         self.lazy_load_file = lazy_load_file
         self.attn_rms_norm_type = self.config.get("rms_norm_type", "sgl-kernel")
         self.apply_gated_attention = self.config.get("apply_gated_attention", False)
+        self.add_module(
+            "rope",
+            _make_ltx_rope(config),
+        )
 
         block_lora_prefix = "model.diffusion_model.blocks"
         model_prefix = "model.diffusion_model"
@@ -460,12 +485,13 @@ class LTX2FFN(WeightModule):
         self.lazy_load_file = lazy_load_file
         block_lora_prefix = "model.diffusion_model.blocks"
         model_prefix = "model.diffusion_model"
+        has_bias = config.get("audio_ff_bias", True) if ffn_prefix == "audio_ff" else config.get("ff_bias", True)
 
         self.add_module(
             f"net_0_proj",
             MM_WEIGHT_REGISTER[self.mm_type](
                 f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.weight",
-                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.bias",
+                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.bias" if has_bias else None,
                 create_cuda_buffer=create_cuda_buffer,
                 create_cpu_buffer=create_cpu_buffer,
                 lazy_load=self.lazy_load,
@@ -478,7 +504,7 @@ class LTX2FFN(WeightModule):
             f"net_2",
             MM_WEIGHT_REGISTER[self.mm_type](
                 f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.weight",
-                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.bias",
+                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.bias" if has_bias else None,
                 create_cuda_buffer=create_cuda_buffer,
                 create_cpu_buffer=create_cpu_buffer,
                 lazy_load=self.lazy_load,
@@ -526,6 +552,11 @@ class LTX2AttentionTP(WeightModule):
         self.lazy_load = lazy_load
         self.lazy_load_file = lazy_load_file
         self.attn_rms_norm_type = self.config.get("rms_norm_type", "sgl-kernel")
+        self.apply_gated_attention = self.config.get("apply_gated_attention", False)
+        self.add_module(
+            "rope",
+            _make_ltx_rope(config),
+        )
 
         block_lora_prefix = "model.diffusion_model.blocks"
         model_prefix = "model.diffusion_model"
@@ -540,6 +571,26 @@ class LTX2AttentionTP(WeightModule):
             "tp_rank": tp_rank,
             "tp_size": tp_size,
         }
+
+        if self.apply_gated_attention:
+            self.add_module(
+                "to_gate_logits",
+                MM_WEIGHT_REGISTER["TensorParallel"](
+                    weight_name=f"{model_prefix}.{block_prefix}.{block_index}.{attn_prefix}.to_gate_logits.weight",
+                    bias_name=f"{model_prefix}.{block_prefix}.{block_index}.{attn_prefix}.to_gate_logits.bias",
+                    mm_type=mm_type,
+                    tp_group=tp_group,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    split_dim="col",
+                    create_cuda_buffer=create_cuda_buffer,
+                    create_cpu_buffer=create_cpu_buffer,
+                    lazy_load=self.lazy_load,
+                    lazy_load_file=self.lazy_load_file,
+                    lora_prefix=block_lora_prefix,
+                    lora_path=lora_path,
+                ),
+            )
 
         self.add_module(
             f"q_norm",
@@ -681,13 +732,14 @@ class LTX2FFNTP(WeightModule):
         self.lazy_load_file = lazy_load_file
         block_lora_prefix = "model.diffusion_model.blocks"
         model_prefix = "model.diffusion_model"
+        has_bias = config.get("audio_ff_bias", True) if ffn_prefix == "audio_ff" else config.get("ff_bias", True)
 
         # First layer: column split
         self.add_module(
             f"net_0_proj",
             MM_WEIGHT_REGISTER["TensorParallel"](
                 f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.weight",
-                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.bias",
+                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.0.proj.bias" if has_bias else None,
                 mm_type=mm_type,
                 tp_group=tp_group,
                 tp_rank=tp_rank,
@@ -706,7 +758,7 @@ class LTX2FFNTP(WeightModule):
             f"net_2",
             MM_WEIGHT_REGISTER["TensorParallel"](
                 f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.weight",
-                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.bias",
+                f"{model_prefix}.{block_prefix}.{block_index}.{ffn_prefix}.net.2.bias" if has_bias else None,
                 mm_type=mm_type,
                 tp_group=tp_group,
                 tp_rank=tp_rank,

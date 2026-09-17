@@ -28,9 +28,7 @@ pipe.create_generator(config_json=f"{lightx2v_path}/configs/z_image/z_image_turb
 seed = 42
 prompt = "A fantasy landscape with mountains and a river, detailed, vibrant colors"
 
-negative_prompt = " "
-
-target_shape = [1024, 1024]
+size = [1024, 1024]
 
 save_result_path = f"{lightx2v_path}/save_results/{model_cls}_{task}_{ts}.png"
 
@@ -38,8 +36,7 @@ save_result_path = f"{lightx2v_path}/save_results/{model_cls}_{task}_{ts}.png"
 pipe.generate(
     seed=seed,
     prompt=prompt,
-    target_shape=target_shape,
-    negative_prompt=negative_prompt,
+    size=size,
     save_result_path=save_result_path,
 )
 
@@ -47,8 +44,7 @@ pipe.generate(
 pipe.generate(
     seed=seed,
     prompt=prompt,
-    target_shape=target_shape,
-    negative_prompt=negative_prompt,
+    size=size,
     save_result_path=save_result_path,
     return_result_tensor=True,
 )

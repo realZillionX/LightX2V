@@ -1,52 +1,42 @@
+from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
 
-from ...schema import TaskResponse
-from ..file_service import FileService
-from ..inference import DistributedInferenceService
+from ...schema import ImageTaskRequest, TaskResponse
 from .base import BaseGenerationService
 
 
 class ImageGenerationService(BaseGenerationService):
-    def __init__(self, file_service: FileService, inference_service: DistributedInferenceService):
-        super().__init__(file_service, inference_service)
-
     def get_output_extension(self) -> str:
         return ".png"
 
     def get_task_type(self) -> str:
         return "t2i,i2i"
 
-    async def generate_with_stop_event(self, message: Any, stop_event) -> Optional[Any]:
+    async def generate_with_stop_event(self, message: ImageTaskRequest, stop_event) -> Optional[Any]:
         try:
-            task_data = {field: getattr(message, field) for field in message.model_fields_set if field != "task_id"}
-            task_data["task_id"] = message.task_id
-            task_data["target_shape"] = message.target_shape
-
-            if hasattr(message, "aspect_ratio"):
-                task_data["aspect_ratio"] = message.aspect_ratio
+            task_data = self.prepare_task_data(message)
 
             if stop_event.is_set():
                 logger.info(f"Task {message.task_id} cancelled before processing")
                 return None
 
             if hasattr(message, "image_path") and message.image_path:
-                await self._process_image_path(message.image_path, task_data)
+                task_data["image_path"] = await self._resolve_image_path(message.image_path)
                 logger.info(f"Task {message.task_id} image path: {task_data.get('image_path')}")
 
             if hasattr(message, "image_mask_path") and message.image_mask_path:
-                await self._process_image_mask_path(message.image_mask_path, task_data)
+                task_data["image_mask_path"] = await self._resolve_image_path(message.image_mask_path)
                 logger.info(f"Task {message.task_id} image mask path: {task_data.get('image_mask_path')}")
                 self._pack_image_and_mask_as_dir(task_data)
                 logger.info(f"Task {message.task_id} packed image+mask dir: {task_data.get('image_path')}")
 
-            self._prepare_output_path(message.save_result_path, task_data)
-            task_data["seed"] = message.seed
-            prefer_memory_result = bool(getattr(message, "prefer_memory_result", False))
-            task_data.pop("prefer_memory_result", None)
+            task_data.pop("image_mask_path", None)
+            prefer_memory_result = message._prefer_memory_result
             task_data.pop("presigned_url", None)
-            task_data["return_result_tensor"] = prefer_memory_result
+            if prefer_memory_result:
+                task_data["return_result_tensor"] = True
 
             result = await self.inference_service.submit_task_async(task_data)
 
@@ -57,32 +47,32 @@ class ImageGenerationService(BaseGenerationService):
                 raise RuntimeError("Task processing failed")
 
             if result.get("status") == "success":
-                actual_save_path = self.file_service.get_output_path(message.save_result_path)
-                if not actual_save_path.suffix:
-                    actual_save_path = actual_save_path.with_suffix(self.get_output_extension())
                 if prefer_memory_result:
                     result_png = result.get("result_png")
                     if not result_png:
                         raise RuntimeError("Image inference did not return in-memory PNG bytes (result_png)")
+                    usage = result.get("usage")
                     return TaskResponse(
                         task_id=message.task_id,
                         task_status="completed",
-                        save_result_path="",
+                        save_result_path=None,
                         result_png=result_png,
+                        usage=usage,
                     )
 
+                output_path = result["save_result_path"]
                 return TaskResponse(
                     task_id=message.task_id,
                     task_status="completed",
-                    save_result_path=actual_save_path.name,
+                    save_result_path=str(Path(output_path).absolute()) if output_path is not None else None,
                 )
             else:
                 error_msg = result.get("error", "Inference failed")
-                raise RuntimeError(error_msg)
+                error_type = result.get("error_type", "")
+                exc = RuntimeError(error_msg)
+                exc.original_error_type = error_type
+                raise exc
 
         except Exception as e:
             logger.exception(f"Task {message.task_id} processing failed: {str(e)}")
             raise
-
-    async def generate_image_with_stop_event(self, message: Any, stop_event) -> Optional[Any]:
-        return await self.generate_with_stop_event(message, stop_event)

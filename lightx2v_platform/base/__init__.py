@@ -6,8 +6,10 @@ from lightx2v_platform.base.hygon_dcu import HygonDcuDevice
 from lightx2v_platform.base.mthreads_musa import MusaDevice
 from lightx2v_platform.base.metax_cuda import MetaxDevice
 from lightx2v_platform.base.nvidia import CudaDevice
+from lightx2v_platform.base.ppu_cuda import PpuDevice
 from lightx2v_platform.base.enflame_gcu import EnflameGcuDevice
 from lightx2v_platform.base.intel_xpu import IntelXpuDevice
+from lightx2v_platform.base.iluvatar_cuda import IluvatarDevice
 
 __all__ = [
     "init_ai_device",
@@ -15,10 +17,12 @@ __all__ = [
     "CudaDevice",
     "MluDevice",
     "MetaxDevice",
+    "PpuDevice",
     "HygonDcuDevice",
     "AmdRocmDevice",
     "NpuDevice",
     "MusaDevice",
     "EnflameGcuDevice",
     "IntelXpuDevice",
+    "IluvatarDevice",
 ]

@@ -3,11 +3,11 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("L",))
 def compress_kernel(
     X,
     XM,
-    L: tl.constexpr,
+    L,
     D: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
@@ -19,7 +19,13 @@ def compress_kernel(
 
     x_offset = idx_bh * L * D
     xm_offset = idx_bh * ((L + BLOCK_L - 1) // BLOCK_L) * D
-    x = tl.load(X + x_offset + offs_l[:, None] * D + offs_d[None, :], mask=offs_l[:, None] < L)
+    # Triton leaves masked lanes undefined when ``other`` is omitted. The
+    # lanes participate in the reduction below, so zero the tail padding.
+    x = tl.load(
+        X + x_offset + offs_l[:, None] * D + offs_d[None, :],
+        mask=offs_l[:, None] < L,
+        other=0.0,
+    )
 
     nx = min(BLOCK_L, L - idx_l * BLOCK_L)
     x_mean = tl.sum(x, axis=0, dtype=tl.float32) / nx
@@ -42,10 +48,20 @@ def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
     arg_k = k - torch.mean(k, dim=-2, keepdim=True)  # smooth-k technique in SageAttention
     pooled_qblocks = mean_pool(q, BLKQ)
     pooled_kblocks = mean_pool(arg_k, BLKK)
+
+    # GQA
+    num_q_heads = q.size(1)
+    num_kv_heads = k.size(1)
+    if num_q_heads != num_kv_heads:
+        assert num_q_heads % num_kv_heads == 0, f"Number of Q heads ({num_q_heads}) must be divisible by number of KV heads ({num_kv_heads})"
+        repeat_factor = num_q_heads // num_kv_heads
+        pooled_kblocks = pooled_kblocks.repeat_interleave(repeat_factor, dim=1)
+
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
 
     K = pooled_score.shape[-1]
-    topk = min(K, int(topk_ratio * K))
+    # Match the training router: short sequences still retain one key block.
+    topk = max(1, min(K, int(topk_ratio * K)))
     lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
 
     sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)

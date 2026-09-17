@@ -66,8 +66,8 @@ def update_weights(model, tensors: Mapping[str, torch.Tensor] | Iterable[tuple[s
     # NeoPP MoE keeps fused expert stacks derived from the source tensors.
     for block in getattr(model.transformer_weights, "blocks", []):
         mlp = getattr(block, "mlp_mot_gen", None)
-        if mlp is not None and hasattr(mlp, "_build_flashinfer_weights"):
-            mlp._build_flashinfer_weights()
+        if mlp is not None and hasattr(mlp, "rebuild_fused_weights"):
+            mlp.rebuild_fused_weights()
     return {
         "updated": sorted(updated),
         "ignored": unknown,

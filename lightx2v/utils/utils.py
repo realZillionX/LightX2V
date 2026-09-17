@@ -61,7 +61,7 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
         if rescale:
             x = (x + 1.0) / 2.0  # -1,1 -> 0,1
         x = torch.clamp(x, 0, 1)
-        x = (x * 255).numpy().astype(np.uint8)
+        x = (x * 255).to(torch.uint8).cpu().numpy()
         outputs.append(x)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -127,6 +127,7 @@ def vae_to_comfyui_image(vae_output: torch.Tensor) -> torch.Tensor:
     Returns:
         ComfyUI Image tensor in range [0, 1]
         Shape: [B, H, W, C] for single frame or [B*T, H, W, C] for video
+        Note: The returned tensor remains on the input device.
     """
     # Handle video tensor (5D) vs image tensor (4D)
     if vae_output.dim() == 5:
@@ -142,7 +143,7 @@ def vae_to_comfyui_image(vae_output: torch.Tensor) -> torch.Tensor:
     images = torch.clamp(images, 0, 1)
 
     # Convert from [B, C, H, W] to [B, H, W, C]
-    images = images.permute(0, 2, 3, 1).cpu()
+    images = images.permute(0, 2, 3, 1)
 
     return images
 
@@ -159,7 +160,7 @@ def vae_to_comfyui_image_inplace(vae_output: torch.Tensor) -> torch.Tensor:
     Returns:
         ComfyUI Image tensor in range [0, 1]
         Shape: [B, H, W, C] for single frame or [B*T, H, W, C] for video
-        Note: The returned tensor is the same object as input (modified in-place)
+        Note: The returned tensor remains on the input device.
     """
     # Handle video tensor (5D) vs image tensor (4D)
     if vae_output.dim() == 5:
@@ -174,8 +175,8 @@ def vae_to_comfyui_image_inplace(vae_output: torch.Tensor) -> torch.Tensor:
     # Clamp values to [0, 1] (inplace)
     vae_output.clamp_(0, 1)
 
-    # Convert from [B, C, H, W] to [B, H, W, C] and move to CPU
-    vae_output = vae_output.permute(0, 2, 3, 1).cpu()
+    # Convert from [B, C, H, W] to [B, H, W, C]
+    vae_output = vae_output.permute(0, 2, 3, 1)
 
     return vae_output
 
@@ -201,10 +202,10 @@ def wan_vae_to_comfy(vae_output: torch.Tensor) -> torch.Tensor:
         # Video: [B, C, T, H, W] -> [B, T, H, W, C]
         vae_output = vae_output.permute(0, 2, 3, 4, 1)
         # -> [B*T, H, W, C]
-        return vae_output.cpu().flatten(0, 1)
+        return vae_output.flatten(0, 1)
     else:
         # Image: [B, C, H, W] -> [B, H, W, C]
-        return vae_output.permute(0, 2, 3, 1).cpu()
+        return vae_output.permute(0, 2, 3, 1)
 
 
 def diffusers_vae_to_comfy(vae_output: torch.Tensor) -> torch.Tensor:
@@ -244,13 +245,11 @@ def save_to_video(
 
     if method == "imageio":
         # Convert to uint8
-        # frames = (images * 255).cpu().numpy().astype(np.uint8)
         frames = (images * 255).to(torch.uint8).cpu().numpy()
         imageio.mimsave(output_path, frames, fps=fps)  # type: ignore
 
     elif method == "ffmpeg":
         # Convert to numpy and scale to [0, 255]
-        # frames = (images * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
         frames = (images * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
         # Convert RGB to BGR for OpenCV/FFmpeg
@@ -258,13 +257,19 @@ def save_to_video(
 
         N, height, width, _ = frames.shape
 
-        # Ensure even dimensions for x264
-        width += width % 2
-        height += height % 2
-
         # Get ffmpeg executable from imageio_ffmpeg
         ffmpeg_exe = ffmpeg.get_ffmpeg_exe()
         out_pix = output_pix_fmt or "yuv420p"
+        if out_pix == "yuv420p" and (width % 2 or height % 2):
+            # yuv420p requires even dimensions.  Keep the actual raw-frame
+            # geometry (changing only ``-s`` corrupts frame boundaries) and
+            # use the same unsampled fallback MoviePy selects for odd output.
+            logger.warning(
+                "Video size {}x{} is odd; using yuv444p instead of yuv420p to preserve the exact crop.",
+                width,
+                height,
+            )
+            out_pix = "yuv444p"
 
         if lossless:
             command = [
@@ -352,7 +357,7 @@ def save_to_image(images: torch.Tensor, output_path: str) -> None:
     Used for ``task=sr`` when conditioning comes from ``image_path`` only (no ``video_path``).
     """
     assert images.dim() == 4 and images.shape[-1] == 3, "Input must be [N, H, W, C] with C=3"
-    frame = images[0].clamp(0, 1).cpu().numpy()
+    frame = images[0].clamp(0, 1).to(device="cpu", dtype=torch.float32).numpy()
     frame_u8 = (frame * 255.0).round().astype(np.uint8)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     Image.fromarray(frame_u8).save(output_path)
@@ -363,6 +368,7 @@ def mux_audio_from_video(
     target_video_path: str,
     output_path: Optional[str] = None,
     prefer_copy: bool = True,
+    trim_to_shortest: bool = True,
 ) -> Optional[str]:
     """Mux audio from source_video_path into target_video_path.
 
@@ -371,6 +377,7 @@ def mux_audio_from_video(
         target_video_path: Video file that contains the video stream to keep.
         output_path: Optional output path. Defaults to target_video_path (in-place replace).
         prefer_copy: If True, try stream copy for audio first, then fallback to AAC re-encode.
+        trim_to_shortest: End the output when its shortest stream ends.
 
     Returns:
         The output path on success, or None on failure.
@@ -406,10 +413,11 @@ def mux_audio_from_video(
             "copy",
             "-c:a",
             audio_codec,
-            "-shortest",
         ]
+        if trim_to_shortest:
+            cmd.append("-shortest")
         # Be explicit about container format in case ffmpeg can't infer it
-        cmd += ["-f", "mp4"]
+        cmd += ["-movflags", "+faststart", "-f", "mp4"]
         if extra_args:
             cmd += extra_args
         cmd.append(tmp_path)
@@ -500,6 +508,11 @@ def load_pt_safetensors(in_path, remove_key=None, include_keys=None):
     ext = os.path.splitext(in_path)[-1]
     if ext in (".pt", ".pth", ".tar"):
         state_dict = torch.load(in_path, map_location="cpu", weights_only=True)
+        # Some official training checkpoints (including Wan-Animate-2's VAE)
+        # keep the inference weights under ``model_state`` alongside optimizer
+        # and training metadata. ``load_weights`` requires a flat tensor dict.
+        if isinstance(state_dict, dict) and isinstance(state_dict.get("model_state"), dict):
+            state_dict = state_dict["model_state"]
         # 处理筛选逻辑
         keys_to_keep = []
         for key in state_dict.keys():
@@ -732,7 +745,7 @@ def validate_config_paths(config: dict) -> None:
     Raises:
         FileNotFoundError: If any checkpoint path in config does not exist
     """
-    # Check dit_quantized_ckpt or dit_original_ckpt
+    # Check DiT / adapter checkpoints
     if "dit_quantized_ckpt" in config and config["dit_quantized_ckpt"] is not None:
         check_path_exists(config["dit_quantized_ckpt"])
         logger.debug(f"✓ Verified dit_quantized_ckpt: {config['dit_quantized_ckpt']}")
@@ -740,6 +753,37 @@ def validate_config_paths(config: dict) -> None:
     if "dit_original_ckpt" in config and config["dit_original_ckpt"] is not None:
         check_path_exists(config["dit_original_ckpt"])
         logger.debug(f"✓ Verified dit_original_ckpt: {config['dit_original_ckpt']}")
+
+    if config.get("model_cls") == "ltx2_5":
+        required_components = (
+            "dit_original_ckpt",
+            "text_encoder_original_ckpt",
+            "video_vae_original_ckpt",
+            "audio_vae_original_ckpt",
+        )
+        optional_components = (
+            "duration_head_original_ckpt",
+            "upsampler_original_ckpt",
+        )
+        for key in required_components:
+            value = config.get(key)
+            if not value:
+                raise ValueError(f"LTX-2.5 requires {key} in the config")
+            check_path_exists(value)
+            logger.debug(f"✓ Verified {key}: {value}")
+        for key in optional_components:
+            value = config.get(key)
+            if value:
+                check_path_exists(value)
+                logger.debug(f"✓ Verified {key}: {value}")
+        if config.get("use_upsampler", False) and not config.get("upsampler_original_ckpt"):
+            raise ValueError("LTX-2.5 two-stage inference requires upsampler_original_ckpt")
+
+    if config.get("model_cls", "") == "infinitetalk":
+        if config.get("adapter_model_path", None) is None:
+            raise ValueError("InfiniteTalk requires adapter_model_path in config.")
+        check_path_exists(config["adapter_model_path"])
+        logger.debug(f"✓ Verified adapter_model_path: {config['adapter_model_path']}")
 
     # For wan2.2, check high and low noise checkpoints
     model_cls = config.get("model_cls", "")
@@ -763,3 +807,12 @@ def validate_config_paths(config: dict) -> None:
             logger.debug(f"✓ Verified low_noise_quantized_ckpt: {config['low_noise_quantized_ckpt']}")
 
     logger.info("✓ Config checkpoint paths validated successfully")
+
+
+def get_rank_and_world_size():
+    rank = 0
+    world_size = 1
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    return rank, world_size

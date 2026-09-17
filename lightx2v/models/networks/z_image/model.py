@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
 
 from lightx2v.models.networks.base_model import BaseTransformerModel
 from lightx2v.models.networks.z_image.infer.offload.transformer_infer import ZImageOffloadTransformerInfer
@@ -9,7 +10,6 @@ from lightx2v.models.networks.z_image.infer.transformer_infer import ZImageTrans
 from lightx2v.models.networks.z_image.weights.post_weights import ZImagePostWeights
 from lightx2v.models.networks.z_image.weights.pre_weights import ZImagePreWeights
 from lightx2v.models.networks.z_image.weights.transformer_weights import ZImageTransformerWeights
-from lightx2v.utils.custom_compiler import compiled_method
 from lightx2v.utils.envs import *
 from lightx2v.utils.utils import *
 
@@ -23,9 +23,6 @@ class ZImageTransformerModel(BaseTransformerModel):
         super().__init__(model_path, config, device, None, lora_path, lora_strength)
         if self.lazy_load:
             self.remove_keys.extend(["layers."])
-
-        if self.config["seq_parallel"]:
-            raise NotImplementedError("Sequence parallel is not implemented for ZImageTransformerModel")
 
         self._init_infer_class()
         self._init_weights()
@@ -43,6 +40,7 @@ class ZImageTransformerModel(BaseTransformerModel):
         self.transformer_infer = self.transformer_infer_class(self.config)
         self.pre_infer = self.pre_infer_class(self.config)
         self.post_infer = self.post_infer_class(self.config)
+        self.pre_infer.set_rope(self.transformer_weights.blocks[0].compute_phases[1].rope)
         if hasattr(self.transformer_infer, "offload_manager"):
             self._init_offload_manager()
 
@@ -62,6 +60,10 @@ class ZImageTransformerModel(BaseTransformerModel):
             block_weights=self.transformer_weights,
             pre_infer_out=pre_infer_out,
         )
+
+        if self.config["seq_parallel"]:
+            hidden_states = self._seq_parallel_post_process(hidden_states, pre_infer_out.x_item_seqlens[0])
+
         noise_pred = self.post_infer.infer(
             self.post_weight,
             hidden_states,
@@ -69,19 +71,30 @@ class ZImageTransformerModel(BaseTransformerModel):
             image_tokens_len=pre_infer_out.image_tokens_len,
         )
 
-        if self.config["seq_parallel"]:
-            noise_pred = self._seq_parallel_post_process(noise_pred)
         return noise_pred
 
     @torch.no_grad()
     def _seq_parallel_pre_process(self, pre_infer_out):
-        raise NotImplementedError("Sequence parallel pre-process is not implemented for ZImageTransformerModel")
+        world_size = dist.get_world_size(self.seq_p_group)
+        cur_rank = dist.get_rank(self.seq_p_group)
+
+        seqlen = pre_infer_out.hidden_states.shape[0]
+        padding_size = (world_size - (seqlen % world_size)) % world_size
+        if padding_size > 0:
+            pre_infer_out.hidden_states = F.pad(pre_infer_out.hidden_states, (0, 0, 0, padding_size))
+
+        pre_infer_out.hidden_states = torch.chunk(pre_infer_out.hidden_states, world_size, dim=0)[cur_rank]
+        pre_infer_out.x_item_seqlens = [pre_infer_out.hidden_states.shape[0]]
+        return pre_infer_out
 
     @torch.no_grad()
-    def _seq_parallel_post_process(self, noise_pred):
-        raise NotImplementedError("Sequence parallel post-process is not implemented for ZImageTransformerModel")
+    def _seq_parallel_post_process(self, hidden_states, image_shard_len):
+        image_hidden_states = hidden_states[:image_shard_len]
+        world_size = dist.get_world_size(self.seq_p_group)
+        gathered_hidden_states = [torch.empty_like(image_hidden_states) for _ in range(world_size)]
+        dist.all_gather(gathered_hidden_states, image_hidden_states, group=self.seq_p_group)
+        return torch.cat(gathered_hidden_states, dim=0)
 
-    @compiled_method()
     @torch.no_grad()
     def infer(self, inputs):
         if self.cpu_offload:
@@ -96,6 +109,7 @@ class ZImageTransformerModel(BaseTransformerModel):
         latents_input = latents
 
         if self.config["enable_cfg"]:
+            assert self.scheduler.sample_guide_scale is not None and self.scheduler.sample_guide_scale > 1.0, f"CFG requires sample_guide_scale > 1, got {self.scheduler.sample_guide_scale!r}"
             if self.config["cfg_parallel"]:
                 # ==================== CFG Parallel Processing ====================
                 cfg_p_group = self.config["device_mesh"].get_group(mesh_dim="cfg_p")

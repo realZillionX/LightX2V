@@ -1,20 +1,11 @@
 import torch.nn.functional as F
 
+from lightx2v.models.video_encoders.hf.seedvr.common.distributed import ops as distributed_ops
 
-def slice_inputs(x, dim=0):
-    return x
-
-
-def gather_outputs(x, gather_dim=0, padding_dim=0, unpad_shape=None, cache=None):
-    return x
-
-
-def gather_seq_scatter_heads_qkv(x, seq_dim=0, qkv_shape=None, cache=None):
-    return x
-
-
-def gather_heads_scatter_seq(x, head_dim=1, seq_dim=0):
-    return x
+gather_heads_scatter_seq = distributed_ops.gather_heads_scatter_seq
+gather_outputs = distributed_ops.gather_outputs
+gather_seq_scatter_heads_qkv = distributed_ops.gather_seq_scatter_heads_qkv
+slice_inputs = distributed_ops.slice_inputs
 
 
 def safe_pad_operation(x, pad):

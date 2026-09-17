@@ -4,10 +4,22 @@ import os
 
 import numpy as np
 import torch
-from diffusers.pipelines.flux2.pipeline_flux2 import compute_empirical_mu
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from loguru import logger
 
+try:
+    from diffusers.pipelines.flux2.pipeline_flux2 import compute_empirical_mu
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+except ImportError:
+    compute_empirical_mu = None
+    retrieve_timesteps = None
+    FlowMatchEulerDiscreteScheduler = None
+
+from lightx2v.models.schedulers.fls_enhance import (
+    apply_scheduler_fls_enhancement,
+    init_scheduler_fls,
+    reset_scheduler_fls_state,
+)
 from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -67,22 +79,21 @@ class Flux2Scheduler(BaseScheduler):
         self.infer_steps = config.get("infer_steps", 50)
         self.sigmas = None
         self.timesteps = None
+        init_scheduler_fls(self)
 
     def prepare(self, input_info):
         self.input_info = input_info
-        self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
-
-        if hasattr(input_info, "latent_image_ids"):
-            self.latent_image_ids = input_info.latent_image_ids
+        if self.generator is None:
+            self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
         else:
-            self.latent_image_ids = None
+            logger.info(f"Generator is not None, using existing generator for latents")
 
-        if hasattr(input_info, "txt_ids"):
-            self.txt_ids = input_info.txt_ids
-        else:
-            self.txt_ids = None
+        self.latent_image_ids = input_info.latent_image_ids
+        self.txt_ids = input_info.txt_ids
 
         self.latents = randn_tensor(input_info.latent_shape, generator=self.generator, device=AI_DEVICE, dtype=self.dtype)
+
+        reset_scheduler_fls_state(self)
 
         self.set_timesteps()
 
@@ -111,8 +122,41 @@ class Flux2Scheduler(BaseScheduler):
 
     def step_post(self):
         t = self.timesteps[self.step_index]
-        latents = self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)[0]
+        noise_pred = self.noise_pred
+        if getattr(self, "inpaint_mask", None) is not None and getattr(self, "input_latents", None) is not None:
+            sigma = self.scheduler.sigmas[self.step_index].to(device=self.latents.device, dtype=self.latents.dtype)
+            expected_noise_pred = (self.latents - self.input_latents) / sigma.clamp(min=1e-6)
+            noise_pred = expected_noise_pred * (1 - self.inpaint_mask) + noise_pred * self.inpaint_mask
+            self.noise_pred = noise_pred
+
+        latents = self.scheduler.step(noise_pred, t, self.latents, return_dict=False)[0]
+        latents = apply_scheduler_fls_enhancement(
+            self,
+            latents,
+            noise_pred,
+            layout="seq",
+            latent_image_ids=self.latent_image_ids,
+        )
         self.latents = latents
+
+    def set_step_index(self, step_index):
+        """Set the diffusers scheduler's internal step index.
+
+        The async PipeFusion driver steps patch-by-patch without going through
+        ``step_pre``/``step_post`` for every patch, so the underlying
+        scheduler's ``_step_index`` (used by ``step()`` to look up the correct
+        sigma) must be advanced explicitly.
+        """
+        self.scheduler._step_index = step_index
+
+    def step_post_patch(self, noise_pred, latents, t):
+        """Patch-level scheduler step for async PipeFusion mode.
+
+        Unlike ``step_post``, this operates on a single patch's latents and
+        noise_pred, and does not apply FLS enhancement (which requires the
+        full latent).
+        """
+        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     def _encode_image(self, image):
         image = image.to(device=AI_DEVICE, dtype=GET_DTYPE())
@@ -163,9 +207,13 @@ class Flux2Scheduler(BaseScheduler):
             latents = latents.reshape(batch_size, num_channels, height * width).permute(0, 2, 1)
             return latents
 
-    def prepare_i2i(self, input_info, input_image, vae):
+    def prepare_i2i(self, input_info, input_image, vae, inpaint_mask=None):
         self.vae = vae
         self.prepare(input_info)
+        self.input_latents = None
+        self.input_image_latents = None
+        self.input_image_ids = None
+        self.inpaint_mask = inpaint_mask.to(AI_DEVICE, dtype=self.dtype) if inpaint_mask is not None else None
 
         image_latents = []
         for img in input_image:
@@ -180,6 +228,7 @@ class Flux2Scheduler(BaseScheduler):
 
                 ref_img_latent = self._pack_latents(ref_img_latent).squeeze(0)
                 ref_img_latent = ref_img_latent.unsqueeze(0).to(AI_DEVICE, dtype=self.dtype)
+                self.input_latents = ref_img_latent
                 self.latents = (1 - self.sigmas[0]) * ref_img_latent + self.sigmas[0] * self.latents
 
         image_latent_ids = self._prepare_image_ids(image_latents, scale=10)
@@ -191,6 +240,16 @@ class Flux2Scheduler(BaseScheduler):
 
         self.input_image_latents = packed_latents
         self.input_image_ids = image_latent_ids
+
+    def clear(self):
+        self.generator = None
+        self.latents = None
+        self.inpaint_mask = None
+        self.input_latents = None
+        self.input_image_latents = None
+        self.input_image_ids = None
+        self.noise_pred = None
+        self.infer_condition = True
 
 
 class Flux2DevScheduler(Flux2Scheduler):

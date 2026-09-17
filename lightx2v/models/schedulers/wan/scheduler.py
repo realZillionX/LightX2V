@@ -2,6 +2,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
+from loguru import logger
 
 from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v.utils.utils import masks_like
@@ -12,7 +13,6 @@ class WanScheduler(BaseScheduler):
     def __init__(self, config):
         super().__init__(config)
         self.infer_steps = self.config["infer_steps"]
-        self.target_video_length = self.config["target_video_length"]
         self.sample_shift = self.config["sample_shift"]
         if self.config["seq_parallel"]:
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
@@ -24,9 +24,49 @@ class WanScheduler(BaseScheduler):
         self.disable_corrector = []
         self.solver_order = 2
         self.noise_pred = None
-        self.sample_guide_scale = self.config["sample_guide_scale"]
+        self.sample_guide_scale = self.config.get("sample_guide_scale")
+        if self.config.get("enable_cfg", False) and self.sample_guide_scale is None:
+            raise ValueError("enable_cfg=true requires sample_guide_scale")
         self.caching_records_2 = [True] * self.config["infer_steps"]
         self.head_size = self.config["dim"] // self.config["num_heads"]
+        self.rope_request_id = 0
+
+    def refresh_from_config(self, config):
+        self.config = config
+        self.infer_steps = int(self.config["infer_steps"])
+        self.sample_shift = float(self.config["sample_shift"])
+        self.sample_guide_scale = self.config.get("sample_guide_scale")
+        self.caching_records = [True] * self.infer_steps
+        self.caching_records_2 = [True] * self.infer_steps
+        self.step_index = 0
+
+    def clear(self):
+        for name in (
+            "generator",
+            "latents",
+            "latents_list",
+            "noise_pred",
+            "noise_pred_cond",
+            "noise_pred_uncond",
+            "noise_pred_guided",
+            "vae_encoder_out",
+            "mask",
+            "timesteps",
+            "sigmas",
+            "timestep_input",
+            "timestep_input_r",
+            "model_outputs",
+            "timestep_list",
+            "last_sample",
+            "this_order",
+        ):
+            setattr(self, name, None)
+        self.step_index = 0
+        self.lower_order_nums = 0
+        self.infer_condition = True
+        self._begin_index = None
+        if hasattr(self, "changing_resolution_index"):
+            self.changing_resolution_index = 0
 
     def _uses_conditioned_latent_prefix(self):
         """Whether this Wan variant keeps a fixed latent prefix during diffusion.
@@ -42,6 +82,7 @@ class WanScheduler(BaseScheduler):
         return model_cls in {"wan2.2", "wan2.2_matrix_game3"}
 
     def prepare(self, seed, latent_shape, image_encoder_output=None):
+        self.rope_request_id += 1
         if self._uses_conditioned_latent_prefix():
             self.vae_encoder_out = image_encoder_output["vae_encoder_out"] if image_encoder_output is not None else None
 
@@ -67,7 +108,10 @@ class WanScheduler(BaseScheduler):
         self.set_timesteps(self.infer_steps, device=AI_DEVICE, shift=self.sample_shift)
 
     def prepare_latents(self, seed, latent_shape, dtype=torch.float32):
-        self.generator = torch.Generator(device=AI_DEVICE).manual_seed(seed)
+        if self.generator is None:
+            self.generator = torch.Generator(device=AI_DEVICE).manual_seed(seed)
+        else:
+            logger.info(f"Generator is not None, using existing generator for latents")
         self.latents = torch.randn(
             latent_shape[0],
             latent_shape[1],

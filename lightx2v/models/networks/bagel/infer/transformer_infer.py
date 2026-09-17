@@ -1,4 +1,3 @@
-from copy import deepcopy
 from typing import Optional
 
 import torch
@@ -16,76 +15,27 @@ from lightx2v.utils.envs import *
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class BagelTransformerInfer(BaseTransformerInfer):
     def __init__(self, config, llm_config):
+        if flash_attn_varlen_func is None:
+            raise ImportError("BAGEL T2I requires flash-attn (`flash_attn`). Install a flash-attn build compatible with your CUDA/PyTorch environment before running BAGEL.")
         self.config = config
         self.llm_config = llm_config
-        self.num_layers = llm_config["num_hidden_layers"]
         self.use_moe = "Mo" in llm_config["layer_module"]
         self.hidden_size = llm_config["hidden_size"]
         self.num_heads = llm_config["num_attention_heads"]
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = llm_config["num_key_value_heads"]
-        self.init_kv_cache()
 
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
-
-    def init_gen_context(self):
-        gen_context = {
-            "kv_lens": [0],
-            "ropes": [0],
-            "past_key_values": NaiveCache(self.num_layers),
-        }
-        return gen_context
-
-    def init_kv_cache(self):
-        self.gen_context = self.init_gen_context()
-        self.cfg_text_context = deepcopy(self.gen_context)
-        self.cfg_img_context = deepcopy(self.gen_context)
 
     def self_attn(
         self,
         weights,
         packed_query_sequence,
         query_lens,
-        packed_query_position_embeddings,
+        packed_rope,
         packed_query_indexes,
         past_key_values,
         key_values_lens,
@@ -136,8 +86,16 @@ class BagelTransformerInfer(BaseTransformerInfer):
             packed_key_states[packed_text_indexes] = weights.k_norm.apply(packed_key_states[packed_text_indexes])
             packed_key_states[packed_vae_token_indexes] = weights.k_norm_moe_gen.apply(packed_key_states[packed_vae_token_indexes])
 
-        packed_cos, packed_sin = packed_query_position_embeddings
-        packed_query_states, packed_key_states = apply_rotary_pos_emb(packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1)
+        packed_rope_freqs, packed_rope_positions = packed_rope
+        rope_kwargs = {"rotary_dim": self.head_dim, "unsqueeze_dim": 1}
+        if packed_rope_positions is not None:
+            rope_kwargs["positions"] = packed_rope_positions
+        packed_query_states, packed_key_states = weights.rope.apply(
+            packed_query_states,
+            packed_key_states,
+            packed_rope_freqs,
+            **rope_kwargs,
+        )
 
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
@@ -160,8 +118,8 @@ class BagelTransformerInfer(BaseTransformerInfer):
             merged_value_states = packed_value_states
             key_values_lens = query_lens
 
-        cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
+        cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(AI_DEVICE)
+        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0)).to(AI_DEVICE)
 
         packed_attn_output = flash_attn_varlen_func(
             q=packed_query_states,
@@ -207,7 +165,7 @@ class BagelTransformerInfer(BaseTransformerInfer):
         layer_idx,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
-        packed_query_position_embeddings: torch.Tensor,
+        packed_rope,
         packed_query_indexes: torch.Tensor,
         past_key_values: Optional[NaiveCache] = None,
         key_values_lens: Optional[torch.Tensor] = None,
@@ -236,7 +194,7 @@ class BagelTransformerInfer(BaseTransformerInfer):
                 weights=block_weight.self_attn,
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
-                packed_query_position_embeddings=packed_query_position_embeddings,
+                packed_rope=packed_rope,
                 packed_query_indexes=packed_query_indexes,
                 past_key_values=past_key_values,
                 key_values_lens=key_values_lens,
@@ -284,17 +242,17 @@ class BagelTransformerInfer(BaseTransformerInfer):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_query_position_embeddings=None,
+        packed_rope=None,
         enable_taylorseer=False,
     ):
         for layer_idx, block_weight in enumerate(block_weights):
             if enable_taylorseer:
-                assert NotImplementedError
+                raise NotImplementedError("TaylorSeer is not implemented for BAGEL transformer inference.")
             packed_query_sequence, past_key_values = self.decoder_layer(
                 block_weight=block_weight,
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
-                packed_query_position_embeddings=packed_query_position_embeddings,
+                packed_rope=packed_rope,
                 packed_query_indexes=packed_query_indexes,
                 past_key_values=past_key_values,
                 key_values_lens=key_values_lens,

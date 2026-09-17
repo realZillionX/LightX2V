@@ -1,9 +1,8 @@
 {
     "infer_steps": 50,
-    "target_video_length": 81,
+    "num_frames": 81,
     "text_len": 512,
-    "target_height": 480,
-    "target_width": 832,
+    "size": [480, 832],
     "self_attn_1_type": "flash_attn_enflame_gcu",
     "cross_attn_1_type": "flash_attn_enflame_gcu",
     "cross_attn_2_type": "flash_attn_enflame_gcu",
@@ -12,7 +11,7 @@
     "enable_cfg": true,
     "cpu_offload": false,
     "modulate_type": "torch",
-    "rope_type": "torch",
+    "rope_type": "torch_real_rope",
     "layer_norm_type": "torch",
     "rms_norm_type": "torch"
 }

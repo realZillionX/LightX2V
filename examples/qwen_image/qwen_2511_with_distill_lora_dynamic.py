@@ -45,7 +45,6 @@ pipe.enable_lora(
 # Create generator manually with specified parameters
 pipe.create_generator(
     attn_mode="flash_attn3",
-    resize_mode="adaptive",
     infer_steps=8,
     guidance_scale=1,
 )
@@ -53,7 +52,6 @@ pipe.create_generator(
 # Generation parameters
 seed = 42
 prompt = "Replace the polka-dot shirt with a light blue shirt."
-negative_prompt = ""
 image_path = "/path/to/img.png"  # or "/path/to/img_0.jpg,/path/to/img_1.jpg"
 save_result_path = "/path/to/save_results/output.png"
 
@@ -62,6 +60,5 @@ pipe.generate(
     seed=seed,
     image_path=image_path,
     prompt=prompt,
-    negative_prompt=negative_prompt,
     save_result_path=save_result_path,
 )

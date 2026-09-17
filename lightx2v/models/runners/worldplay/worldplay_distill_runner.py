@@ -1,13 +1,12 @@
 import gc
-import os
 
 import torch
-from loguru import logger
 
 from lightx2v.models.networks.worldplay.model import WorldPlayModel
 from lightx2v.models.networks.worldplay.pose_utils import pose_to_input
 from lightx2v.models.runners.hunyuan_video.hunyuan_video_15_runner import HunyuanVideo15Runner
 from lightx2v.models.schedulers.worldplay.scheduler import WorldPlayDistillScheduler
+from lightx2v.utils.input_info import WorldPlayI2VInputInfo, WorldPlayT2VInputInfo
 from lightx2v.utils.profiler import ProfilingContext4DebugL2
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -26,6 +25,9 @@ class WorldPlayDistillRunner(HunyuanVideo15Runner):
     - Autoregressive chunk-based generation
     - Few-step inference (4 steps by default)
     """
+
+    input_info_cls_by_task = {"t2v": WorldPlayT2VInputInfo, "i2v": WorldPlayI2VInputInfo}
+    supported_request_fields_by_task = {task: request_fields | {"pose"} for task, request_fields in HunyuanVideo15Runner.supported_request_fields_by_task.items()}
 
     def __init__(self, config):
         # Set default distill parameters
@@ -62,17 +64,7 @@ class WorldPlayDistillRunner(HunyuanVideo15Runner):
             action_ckpt=self.action_ckpt,
         )
 
-        if self.sr_version is not None:
-            from lightx2v.models.networks.hunyuan_video.model import HunyuanVideo15Model
-
-            self.config_sr["transformer_model_path"] = os.path.join(os.path.dirname(self.config.transformer_model_path), self.sr_version)
-            self.config_sr["is_sr_running"] = True
-            model_sr = HunyuanVideo15Model(self.config_sr["model_path"], self.config_sr, self.init_device)
-            self.config_sr["is_sr_running"] = False
-        else:
-            model_sr = None
-
-        self.model_sr = model_sr
+        self.model_sr = self.load_sr_transformer()
         return model
 
     @ProfilingContext4DebugL2("Run Encoders")
@@ -90,7 +82,7 @@ class WorldPlayDistillRunner(HunyuanVideo15Runner):
 
         # Process pose input if available
         pose_output = None
-        if hasattr(self.input_info, "pose") and self.input_info.pose is not None:
+        if self.input_info.pose is not None:
             pose_output = self._process_pose_input(
                 self.input_info.pose,
                 self.input_info.latent_shape[1],  # num latent frames
@@ -121,7 +113,7 @@ class WorldPlayDistillRunner(HunyuanVideo15Runner):
 
         # Process pose input if available
         pose_output = None
-        if hasattr(self.input_info, "pose") and self.input_info.pose is not None:
+        if self.input_info.pose is not None:
             pose_output = self._process_pose_input(
                 self.input_info.pose,
                 self.input_info.latent_shape[1],  # num latent frames
@@ -151,22 +143,12 @@ class WorldPlayDistillRunner(HunyuanVideo15Runner):
         Returns:
             Dict with viewmats, Ks, action tensors
         """
-        try:
-            viewmats, Ks, action = pose_to_input(pose_data, latent_num)
-
-            # Move to device and add batch dimension
-            viewmats = viewmats.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32)
-            Ks = Ks.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32)
-            action = action.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.long)
-
-            return {
-                "viewmats": viewmats,
-                "Ks": Ks,
-                "action": action,
-            }
-        except Exception as e:
-            logger.warning(f"Failed to process pose input: {e}. Continuing without pose conditioning.")
-            return None
+        viewmats, Ks, action = pose_to_input(pose_data, latent_num)
+        return {
+            "viewmats": viewmats.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32),
+            "Ks": Ks.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32),
+            "action": action.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.long),
+        }
 
     def init_run(self):
         """Initialize run with pose conditioning support."""

@@ -23,10 +23,12 @@ except ImportError:
     Rotation = None
     Slerp = None
 
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
 from lightx2v.models.runners.wan.wan_runner import Wan22DenseRunner, build_wan_model_with_lora
 from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import GET_DTYPE
+from lightx2v.utils.input_info import ActionI2VInputInfo
 from lightx2v.utils.profiler import GET_RECORDER_MODE, ProfilingContext4DebugL1, ProfilingContext4DebugL2
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -36,13 +38,6 @@ torch_device_module = getattr(torch, AI_DEVICE)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _MATRIX_GAME3_CONFIG_ROOT_RELATIVE = Path("Matrix-Game-3.0")
-_MATRIX_GAME3_DEFAULT_NEGATIVE_PROMPT = (
-    "Vibrant colors, overexposure, static, blurred details, subtitles, style, artwork, "
-    "painting, still image, overall grayness, worst quality, low quality, JPEG compression "
-    "residue, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn faces, "
-    "deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, "
-    "three legs, crowded background, walking backwards"
-)
 _MATRIX_GAME3_WSAD_OFFSET = 12.35
 _MATRIX_GAME3_DIAGONAL_OFFSET = 8.73
 _MATRIX_GAME3_MOUSE_PITCH_SENSITIVITY = 15.0
@@ -1027,12 +1022,16 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
     - Roll latent history across overlapping segments, then trim duplicated decoded frames.
     """
 
+    input_info_cls_by_task = {"i2v": ActionI2VInputInfo}
+    supported_request_fields_by_task = {
+        "i2v": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"action_path", "image_path", "pose", "size"},
+    }
+
     def __init__(self, config):
         with config.temporarily_unlocked():
             # The public pipeline still instantiates us as "wan2.2_matrix_game3", but
             # the shared Wan2.2 runner expects `model_cls == "wan2.2"` for common setup.
             original_model_cls = str(config.get("model_cls", "wan2.2_matrix_game3"))
-            config["runner_model_cls"] = original_model_cls
             config["model_cls"] = "wan2.2"
             config["mode"] = "matrix_game3"
             config["use_image_encoder"] = False
@@ -1093,29 +1092,8 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
         self._mg3_tail_latents: Optional[torch.Tensor] = None
         self._mg3_noise_generator: Optional[torch.Generator] = None
 
-    def set_inputs(self, inputs):
-        super().set_inputs(inputs)
-        # Some callers still use `pose`, others use `action_path`. Mirror both so the
-        # runner remains compatible with older LightX2V entry points.
-        if "action_path" in self.input_info.__dataclass_fields__:
-            self.input_info.action_path = inputs.get("action_path", inputs.get("pose", ""))
-        if "pose" in self.input_info.__dataclass_fields__:
-            self.input_info.pose = inputs.get("pose", inputs.get("action_path", ""))
-
-    def run_text_encoder(self, input_info):
-        # Official Matrix-Game-3 base inference uses a non-empty default negative
-        # prompt for CFG. If the caller leaves `--negative_prompt` empty, reuse the
-        # official default so the unconditional branch matches the reference path.
-        if self.config.get("enable_cfg", False) and not getattr(input_info, "negative_prompt", ""):
-            input_info.negative_prompt = self.config.get("sample_neg_prompt", _MATRIX_GAME3_DEFAULT_NEGATIVE_PROMPT)
-            logger.info("[matrix-game-3] negative_prompt not provided; falling back to the official sample_neg_prompt for CFG.")
-        return super().run_text_encoder(input_info)
-
     def load_transformer(self):
-        from lightx2v.models.networks.wan.matrix_game3_model import (
-            WanMtxg3Model,
-            WanMtxg3OfficialBaseModel,
-        )
+        from lightx2v.models.networks.wan.matrix_game3_model import WanMtxg3Model
 
         # The backbone is still a Wan2.2 DiT, but Matrix-Game-3 swaps in a dedicated
         # network wrapper that understands keyboard / mouse / camera conditions.
@@ -1126,15 +1104,7 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
         }
         lora_configs = self.config.get("lora_configs")
         if not lora_configs:
-            if self.config.get("use_base_model", False):
-                try:
-                    logger.info("[matrix-game-3] base-model path will use the official WanModel forward for denoising.")
-                    return WanMtxg3OfficialBaseModel(**model_kwargs)
-                except Exception as exc:
-                    logger.warning(
-                        "[matrix-game-3] failed to initialize official base-model forward ({}); falling back to the custom LightX2V MG3 model.",
-                        exc,
-                    )
+            logger.info("[matrix-game-3] loading MG3 {} checkpoint with the LightX2V inference stack.", self._get_sub_model_folder())
             return WanMtxg3Model(**model_kwargs)
         return build_wan_model_with_lora(WanMtxg3Model, self.config, model_kwargs, lora_configs, model_type="wan2.2")
 
@@ -1206,7 +1176,6 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
             self.config["num_channels_latents"] = int(model_config.get("in_dim", self.config.get("num_channels_latents", 48)))
             self.config["vae_stride"] = tuple(self.config.get("vae_stride", (4, 16, 16)))
             self.config["patch_size"] = tuple(model_config.get("patch_size", self.config.get("patch_size", (1, 2, 2))))
-            self.config["sample_neg_prompt"] = self.config.get("sample_neg_prompt", _MATRIX_GAME3_DEFAULT_NEGATIVE_PROMPT)
 
         action_config = self.config.get("action_config", {})
         self.keyboard_dim_in = int(self.config.get("keyboard_dim_in", action_config.get("keyboard_dim_in", 6)))
@@ -1271,8 +1240,7 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
     def run_vae_encoder(self, img):
         # Unlike the generic Wan2.2 i2v path, MG3 only encodes the first frame. The
         # remaining temporal slots are left zeroed and later mixed with scheduler noise.
-        target_h = int(self.config["target_height"])
-        target_w = int(self.config["target_width"])
+        target_h, target_w = self.get_target_size()
         target_ratio = target_h / target_w
         input_h, input_w = img.height, img.width
         if input_h / input_w > target_ratio:
@@ -2106,8 +2074,6 @@ class WanMatrixGame3Runner(Wan22DenseRunner):
 
     def run_main(self):
         self.init_run()
-        if self.config.get("compile", False) and hasattr(self.model, "comple"):
-            self.model.select_graph_for_compile(self.input_info)
         for segment_idx in range(self.video_segment_num):
             logger.info(f"🔄 start segment {segment_idx + 1}/{self.video_segment_num}")
             with ProfilingContext4DebugL1(

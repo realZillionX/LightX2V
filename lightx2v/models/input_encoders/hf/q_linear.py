@@ -31,7 +31,14 @@ try:
 except ImportError:
     fp8_linear = None
 
+from lightx2v.common.ops.mm.fp8_f16_accum import (
+    fp8_f16_accum_linear,
+    fp8_f16_accum_mm_available,
+    validate_fp8_f16_accum_qmax,
+)
+from lightx2v.common.ops.mm.sgl_kernel import sgl_fp8_scaled_mm
 from lightx2v.common.ops.mm.triton_kernels import fp8_gemm_bias_triton, fp8_gemm_triton, fp8_quantize_triton, int8_gemm_bias_triton, int8_gemm_triton, int8_quantize_triton
+from lightx2v_platform.ops.mm.mthreads_musa.fp8_scaled_mm import fp8_linear as musa_fp8_linear
 
 
 class TritonQuantLinearInt8(nn.Module):
@@ -267,20 +274,16 @@ class SglQuantLinearFp8(nn.Module):
             self.register_buffer("bias", None)
 
     def act_quant_func(self, x):
-        m, k = x.shape
-        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda", requires_grad=False)
-        input_tensor_scale = torch.empty((m, 1), dtype=torch.float32, device="cuda", requires_grad=False)
+        input_tensor_quant = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        input_tensor_scale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
         sgl_kernel.sgl_per_token_quant_fp8(x, input_tensor_quant, input_tensor_scale)
         return input_tensor_quant, input_tensor_scale
 
     def forward(self, input_tensor):
         input_tensor = input_tensor.squeeze(0)
-        shape = (input_tensor.shape[0], self.weight.shape[0])
         dtype = input_tensor.dtype
-        device = input_tensor.device
-        output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
         input_tensor_quant, input_tensor_scale = self.act_quant_func(input_tensor)
-        output_tensor = sgl_kernel.fp8_scaled_mm(
+        output_tensor = sgl_fp8_scaled_mm(
             input_tensor_quant,
             self.weight.t(),
             input_tensor_scale,
@@ -291,14 +294,87 @@ class SglQuantLinearFp8(nn.Module):
 
         return output_tensor.unsqueeze(0)
 
-    def _apply(self, fn):
-        for module in self.children():
-            module._apply(fn)
+    def _apply(self, fn, recurse=True):
+        if recurse:
+            for module in self.children():
+                module._apply(fn)
 
         def maybe_cast(t):
-            if t is not None and t.device != fn(t).device:
-                return fn(t)
-            return t
+            if t is None:
+                return None
+            transformed = fn(t)
+            if transformed.dtype == t.dtype:
+                return transformed
+            if transformed.device == t.device:
+                return t
+            return t.to(transformed.device)
+
+        self.weight = maybe_cast(self.weight)
+        self.weight_scale = maybe_cast(self.weight_scale)
+        self.bias = maybe_cast(self.bias)
+        return self
+
+
+class F16AccumQuantLinearFp8(SglQuantLinearFp8):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fp8_activation_qmax = None
+
+    def enable_fp8_f16_accum(self, activation_qmax):
+        activation_qmax = validate_fp8_f16_accum_qmax(activation_qmax)
+        if fp8_f16_accum_mm_available():
+            self.fp8_activation_qmax = activation_qmax
+
+    def forward(self, input_tensor):
+        if self.fp8_activation_qmax is None:
+            return super().forward(input_tensor)
+        return fp8_f16_accum_linear(
+            input_tensor,
+            self.weight.t(),
+            self.weight_scale,
+            self.bias,
+            self.fp8_activation_qmax,
+        )
+
+
+class MusaQuantLinearFp8(nn.Module):
+    """MUSA W8A8 FP8 linear with per-channel weights and per-token inputs."""
+
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn))
+        self.register_buffer("weight_scale", torch.empty((out_features, 1), dtype=torch.float32))
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
+        else:
+            self.register_buffer("bias", None)
+
+    def forward(self, input_tensor):
+        output_dtype = input_tensor.dtype if input_tensor.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+        return musa_fp8_linear(
+            input_tensor,
+            self.weight,
+            self.weight_scale,
+            bias=self.bias,
+            out_dtype=output_dtype,
+        )
+
+    def _apply(self, fn, recurse=True):
+        if recurse:
+            for module in self.children():
+                module._apply(fn)
+
+        def maybe_cast(tensor):
+            if tensor is None:
+                return None
+            transformed = fn(tensor)
+            if transformed.dtype == tensor.dtype:
+                return transformed
+            if transformed.device == tensor.device:
+                return tensor
+            return tensor.to(transformed.device)
 
         self.weight = maybe_cast(self.weight)
         self.weight_scale = maybe_cast(self.weight_scale)

@@ -2,10 +2,11 @@ packaging
 ninja
 numpy
 scipy
-torch<=2.8.0
-torchvision<=0.23.0
-torchaudio<=2.8.0
+torch
+torchvision
+torchaudio
 torchao
+comfy-kitchen>=0.2.15
 diffusers
 transformers
 tokenizers
@@ -17,6 +18,10 @@ imageio
 imageio-ffmpeg
 einops
 loguru
+omegaconf
+peft
+swanlab
+langdetect>=1.0.9
 sgl-kernel
 qtorch
 ftfy

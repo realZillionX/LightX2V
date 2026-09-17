@@ -1,0 +1,194 @@
+from pathlib import Path
+
+import torch
+from loguru import logger
+
+from lightx2v_train.runtime.distributed import barrier, get_rank, get_world_size, is_distributed
+from lightx2v_train.utils.registry import INFERENCER_REGISTER
+
+from .base import BaseInferencer, cached_condition
+
+
+def _record_has_source_images(record):
+    return bool(record.get("source_images"))
+
+
+@INFERENCER_REGISTER("image_infer")
+class ImageInferencer(BaseInferencer):
+    def _inference_sigmas(self, num_inference_steps, *, latent_hw=None):
+        sigmas = self.infer_config.get("sigmas")
+        pcm_solver_steps = self.infer_config.get("pcm_solver_steps")
+        if sigmas is not None and pcm_solver_steps is not None:
+            raise ValueError("Set only one of inference.sigmas and inference.pcm_solver_steps.")
+        if pcm_solver_steps is None:
+            return sigmas
+
+        from lightx2v_train.trainers.consistency.pcm import pcm_inference_sigmas
+
+        return pcm_inference_sigmas(
+            num_inference_steps,
+            int(pcm_solver_steps),
+            scheduler=self.scheduler,
+            latent_hw=latent_hw,
+        )
+
+    def _load_infer_sample(self, index, prompt):
+        infer_sample = self.dataloader_val.dataset[index]
+        infer_sample["conditioning"]["prompt"] = prompt
+        return infer_sample
+
+    def _load_dummy_sample(self, records):
+        for index, record in enumerate(records):
+            if _record_has_source_images(record):
+                return self._load_infer_sample(index, " ")
+        if getattr(self.dataloader_val.dataset, "uses_cache_dataset", False):
+            return self._load_infer_sample(0, records[0]["prompt"])
+        return {"inputs": {}, "conditioning": {"prompt": " "}, "meta": {}}
+
+    def _decode_latent(self, latent):
+        vae = getattr(self.model, "vae", None)
+        if vae is None:
+            raise RuntimeError("image_infer requires a loaded VAE for decoding.")
+
+        cpu_offload = self.infer_config.get("vae_cpu_offload", False)
+        if cpu_offload:
+            vae.to(self.model.device)
+        try:
+            return self.model.decode_latent(latent)
+        finally:
+            if cpu_offload:
+                vae.to("cpu")
+                torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def infer(self):
+        dataset = self.dataloader_val.dataset
+        sample_processor = getattr(dataset, "sample_processor", None)
+        if sample_processor is None:
+            raise ValueError("image_infer requires a dataset with a sample_processor")
+
+        records = dataset.samples
+        prompts = [record["prompt"] for record in records]
+        rank = get_rank()
+        world_size = get_world_size()
+
+        default_height = self.infer_config.get("default_height", 1024)
+        default_width = self.infer_config.get("default_width", 1024)
+        num_inference_steps = self.infer_config.get("num_inference_steps", 50)
+        logging_config = self.config.get("logging", {})
+        infer_log_every_steps = max(1, int(logging_config.get("infer_log_every_steps", 10)))
+
+        base_seed = self.infer_config.get("seed", 42)
+
+        vae = getattr(self.model, "vae", None)
+        if self.infer_config.get("vae_tiling", False):
+            if vae is None or not hasattr(vae, "enable_tiling"):
+                raise RuntimeError("inference.vae_tiling requires a VAE that supports enable_tiling().")
+            vae.enable_tiling()
+
+        lora_config = self.infer_config.get("lora_config", None)
+        lora_path = lora_config.get("path", None) if lora_config else None
+        should_load_lora = lora_path and getattr(self.model, "_infer_lora_adapter_name", None) is None
+        if should_load_lora:
+            self.model.load_lora_for_infer(lora_path)
+
+        self.enable_cfg = self.infer_config.get("enable_cfg", True)
+        uses_cache = getattr(dataset, "uses_cache_dataset", False)
+        has_source_condition = any(_record_has_source_images(record) for record in records)
+        if self.enable_cfg:
+            self.guidance_scale = self.infer_config.get("cfg_guidance_scale", 4.0)
+            negative_prompt = self.infer_config.get("negative_prompt", " ")
+            negative_sample = {"inputs": {}, "conditioning": {"prompt": negative_prompt}, "meta": {}}
+            static_neg_cond = None if has_source_condition or uses_cache else self.model.encode_inference_condition(negative_sample, is_negative=True)
+        else:
+            self.guidance_scale = None
+            negative_prompt = None
+            static_neg_cond = None
+
+        saved_paths = []
+        self.model.set_denoiser_eval()
+        num_slots = (len(prompts) + world_size - 1) // world_size if is_distributed() else len(prompts)
+        logger.info("[infer] start samples={} steps={} output_dir={}", len(prompts), num_inference_steps, self.output_infer_dir)
+        with torch.no_grad():
+            for slot in range(num_slots):
+                i = slot * world_size + rank if is_distributed() else slot
+                has_sample = i < len(prompts)
+                prompt = prompts[i] if has_sample else " "
+                infer_sample = self._load_infer_sample(i, prompt) if has_sample else self._load_dummy_sample(records)
+
+                height, width = sample_processor.infer_target_size(infer_sample, default_height, default_width)
+                seed = base_seed + i if has_sample else base_seed
+                generator = torch.Generator(device=self.model.device).manual_seed(seed)
+                pos_cond = cached_condition(infer_sample, self.model, "positive")
+                if pos_cond is None:
+                    pos_cond = self.model.encode_inference_condition(infer_sample)
+                if self.enable_cfg:
+                    neg_cond = cached_condition(infer_sample, self.model, "negative")
+                    if neg_cond is None:
+                        if uses_cache:
+                            cache_path = infer_sample.get("meta", {}).get("training_cache_path", "<unknown>")
+                            raise KeyError(f"Cached inference with CFG requires conditioning.negative in {cache_path}.")
+                        if has_source_condition:
+                            neg_sample = {
+                                "inputs": infer_sample["inputs"],
+                                "conditioning": {**infer_sample["conditioning"], "prompt": negative_prompt},
+                                "meta": infer_sample["meta"],
+                            }
+                            neg_cond = self.model.encode_inference_condition(neg_sample, is_negative=True)
+                        else:
+                            neg_cond = static_neg_cond
+                else:
+                    neg_cond = None
+                latent = self.model.prepare_infer_latents(height, width, generator)
+                latent_hw = (latent.shape[-2], latent.shape[-1])
+                self.scheduler.set_timesteps(
+                    num_inference_steps,
+                    sigmas=self._inference_sigmas(
+                        num_inference_steps,
+                        latent_hw=latent_hw,
+                    ),
+                    latent_hw=latent_hw,
+                )
+                total_steps = len(self.scheduler.infer_timesteps)
+
+                if has_sample:
+                    logger.info("[infer] sample={}/{} seed={} size={}x{} start", i + 1, len(prompts), seed, height, width)
+                for step_idx, _ in enumerate(self.scheduler.infer_timesteps):
+                    # scheduler timesteps are in [0, 1000]
+                    sigma = self.scheduler.infer_sigmas[step_idx].unsqueeze(0)  # shape (1,) required by diffusers
+                    # sigma is in [0, 1]
+                    model_output = self.cfg_guided_denoise(
+                        latents=latent,
+                        timestep_or_sigma=sigma,
+                        pos_cond=pos_cond,
+                        neg_cond=neg_cond,
+                    )
+                    latent = self.scheduler.step(model_output, step_idx, latent)
+                    step = step_idx + 1
+                    if has_sample and (step == 1 or step % infer_log_every_steps == 0 or step == total_steps):
+                        logger.info("[infer] sample={}/{} step={}/{}", i + 1, len(prompts), step, total_steps)
+
+                if not has_sample:
+                    continue
+
+                images = self._decode_latent(latent)
+
+                if self.output_infer_dir is not None:
+                    save_path = Path(self.output_infer_dir) / f"{i:05d}.png"
+                    images[0].save(save_path)
+                    logger.info("[infer] sample={}/{} saved path={}", i + 1, len(prompts), save_path)
+                    saved_paths.append(str(save_path))
+                logger.info("[infer] sample={}/{} done", i + 1, len(prompts))
+
+        barrier()
+
+        if should_load_lora:
+            self.model.unload_lora_for_infer()
+
+        saved_count = len(saved_paths)
+        if is_distributed():
+            saved_count_tensor = torch.tensor(saved_count, device=self.model.device, dtype=torch.int64)
+            torch.distributed.all_reduce(saved_count_tensor, op=torch.distributed.ReduceOp.SUM)
+            saved_count = saved_count_tensor.item()
+        logger.info("[infer] finished saved={}", saved_count)
+        return saved_paths

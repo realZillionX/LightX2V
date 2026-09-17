@@ -1,4 +1,3 @@
-import gc
 import math
 
 import torch
@@ -12,11 +11,15 @@ from lightx2v.models.input_encoders.hf.qwen25.qwen25_vlforconditionalgeneration 
 from lightx2v.models.networks.lora_adapter import LoraAdapter
 from lightx2v.models.networks.qwen_image.model import QwenImageTransformerModel
 from lightx2v.models.runners.default_runner import DefaultRunner
+from lightx2v.models.runners.request_fields import IMAGE_REQUEST_FIELDS
 from lightx2v.models.schedulers.qwen_image.scheduler import QwenImageScheduler
 from lightx2v.models.video_encoders.hf.qwen_image.vae import AutoencoderKLQwenImageVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
+from lightx2v.utils.input_info import I2IInputInfo, T2IInputInfo
 from lightx2v.utils.profiler import *
+
+# from lightx2v.utils.torch_trace_profiler import TorchTraceProfileContext
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -55,6 +58,18 @@ def build_qwen_image_model_with_lora(qwen_module, config, model_kwargs, lora_con
 class QwenImageRunner(DisaggMixin, DefaultRunner):
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
+    _WARMUP_RESOLUTIONS = ((480, 480), (832, 1248))
+    _WARMUP_TASKS = ("t2i", "i2i")
+    supported_request_fields_by_task = {
+        "t2i": IMAGE_REQUEST_FIELDS,
+        "i2i": IMAGE_REQUEST_FIELDS | {"i2i_denoise_strength", "image_path"},
+    }
+
+    def get_supported_request_fields(self, task):
+        supported_request_fields = super().get_supported_request_fields(task)
+        if task == "i2i" and self.config.get("layered", False):
+            supported_request_fields -= {"i2i_denoise_strength"}
+        return supported_request_fields
 
     def __init__(self, config):
         super().__init__(config)
@@ -69,10 +84,103 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         if self.text_encoder_type in ["lightllm_service", "lightllm_kernel"]:
             logger.info(f"Using LightLLM text encoder: {self.text_encoder_type}")
 
-    def set_config(self, config_modify):
-        """Apply per-request overrides and optionally sync disagg fields."""
-        super().set_config(config_modify)
-        self.apply_disagg_request_overrides(config_modify)
+    def check_reuse_support(self):
+        pass
+
+    @ProfilingContext4DebugL1("Warmup")
+    def run_warmup(self):
+        task = self.config.get("task")
+        if task not in self._WARMUP_TASKS:
+            raise NotImplementedError(f"Qwen-Image warmup does not support task: {task}")
+        if self.is_layered:
+            raise NotImplementedError("Qwen-Image warmup does not support layered generation")
+
+        if self.config.get("lazy_load", False):
+            try:
+                self.model = self.load_transformer()
+                self.model.set_scheduler(self.scheduler)
+                self.text_encoders = self.load_text_encoder()
+                self._run_warmup()
+            finally:
+                self.clean_lazy_load_warmup()
+        else:
+            self._run_warmup()
+
+        self._maybe_freeze_gc()
+
+    def _run_warmup(self):
+        scheduler = self.model.scheduler
+        t2i_text_cache = None
+
+        for height, width in self._WARMUP_RESOLUTIONS:
+            logger.info(f"Warmup: {height}x{width}")
+            try:
+                t2i_text_cache = self._prepare_warmup_inputs(height, width, t2i_text_cache)
+                scheduler.generator = None
+                scheduler.prepare(self.input_info)
+                scheduler.step_pre(step_index=0)
+                self.model.infer(self.inputs)
+                scheduler.step_post()
+                self.run_vae_decoder(scheduler.latents)
+                torch_device_module.synchronize()
+            finally:
+                if self.config.get("cpu_offload", False) and self.config.get("offload_granularity") == "model":
+                    self.model.to_cpu()
+                self.clear_warmup_state()
+                self.input_info = None
+                self.__dict__.pop("inputs", None)
+
+        logger.info("[Warmup] Warmup completed")
+
+    def _prepare_warmup_inputs(self, height, width, t2i_text_cache=None):
+        task = self.config["task"]
+        input_info_cls = T2IInputInfo if task == "t2i" else I2IInputInfo
+        self.input_info = input_info_cls(
+            seed=0,
+            prompt="warmup",
+            negative_prompt=" " if self.config["enable_cfg"] else None,
+            size=[height, width],
+            return_result_tensor=True,
+        )
+
+        if task == "t2i":
+            if t2i_text_cache is None:
+                text_encoder_output = self.run_text_encoder(self.input_info.prompt, neg_prompt=self.input_info.negative_prompt)
+                t2i_text_cache = text_encoder_output, tuple(self.input_info.txt_seq_lens)
+            else:
+                text_encoder_output, txt_seq_lens = t2i_text_cache
+                self.input_info.txt_seq_lens = list(txt_seq_lens)
+            image_encoder_output = None
+        else:
+            image = Image.new("RGB", (width, height), color=0)
+            text_encoder_output = self.run_text_encoder(self.input_info.prompt, [image], neg_prompt=self.input_info.negative_prompt)
+            image_encoder_output = [self.run_vae_encoder(vae_image) for vae_image in text_encoder_output["image_info"]["vae_image_list"]]
+
+        self.inputs = {
+            "text_encoder_output": text_encoder_output,
+            "image_encoder_output": image_encoder_output,
+        }
+        self.set_latent_shape()
+        return t2i_text_cache
+
+    def clear_warmup_state(self):
+        self.model.scheduler.clear()
+        self.model.pre_infer.clear_rope_cache()
+
+    def clean_lazy_load_warmup(self):
+        model = getattr(self, "model", None)
+        if model is not None:
+            torch_device_module.synchronize()
+            if hasattr(getattr(model, "transformer_infer", None), "offload_manager"):
+                del model.transformer_infer.offload_manager
+
+        self.scheduler.transformer_infer = None
+        self.model = None
+        for name in ("text_encoders", "vae"):
+            if hasattr(self, name):
+                delattr(self, name)
+        model = None
+        self.maybe_empty_cache(collect_garbage=True)
 
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
@@ -102,7 +210,6 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             self.text_encoders = self.load_text_encoder()
             self.image_encoder = self.load_image_encoder()
             self.vae = self.load_vae()
-            self.vfi_model = self.load_vfi_model() if "video_frame_interpolation" in self.config else None
 
     def load_transformer(self):
         qwen_image_model_kwargs = {
@@ -189,10 +296,8 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             return
         if self.config["task"] == "t2i":
             self.run_input_encoder = self._run_input_encoder_local_t2i
-        elif self.config["task"] == "i2i":
-            self.run_input_encoder = self._run_input_encoder_local_i2i
         else:
-            raise NotImplementedError(f"QwenImageRunner does not support task: {self.config['task']}")
+            self.run_input_encoder = self._run_input_encoder_local_i2i
 
     @ProfilingContext4DebugL2("Run DiT")
     def _run_dit_local(self, total_steps=None):
@@ -211,8 +316,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         text_encoder_output = self.run_text_encoder(prompt, neg_prompt=self.input_info.negative_prompt)
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             del self.text_encoders[0]
-        torch_device_module.empty_cache()
-        gc.collect()
+        self.maybe_empty_cache()
         return {
             "text_encoder_output": text_encoder_output,
             "image_encoder_output": None,
@@ -235,6 +339,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_i2i(self):
+        self.input_info.original_size.clear()
         image_paths_list = self.input_info.image_path.split(",")
         images_list = []
         for image_path in image_paths_list:
@@ -255,8 +360,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         for vae_image in text_encoder_output["image_info"]["vae_image_list"]:
             image_encoder_output = self.run_vae_encoder(image=vae_image)
             image_encoder_output_list.append(image_encoder_output)
-        torch_device_module.empty_cache()
-        gc.collect()
+        self.maybe_empty_cache()
         return {
             "text_encoder_output": text_encoder_output,
             "image_encoder_output": image_encoder_output_list,
@@ -271,7 +375,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             prompt_embeds, _, _ = self.text_encoders[0].infer([text])
             self.input_info.txt_seq_lens = [prompt_embeds.shape[1]]
             text_encoder_output["prompt_embeds"] = prompt_embeds
-            if self.config["enable_cfg"] and neg_prompt is not None:
+            if self.config["enable_cfg"]:
                 neg_prompt_embeds, _, _ = self.text_encoders[0].infer([neg_prompt])
                 self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[1])
                 text_encoder_output["negative_prompt_embeds"] = neg_prompt_embeds
@@ -280,7 +384,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             self.input_info.txt_seq_lens = [prompt_embeds.shape[1]]
             text_encoder_output["prompt_embeds"] = prompt_embeds
             text_encoder_output["image_info"] = image_info
-            if self.config["enable_cfg"] and neg_prompt is not None:
+            if self.config["enable_cfg"]:
                 neg_prompt_embeds, _, _ = self.text_encoders[0].infer([neg_prompt], image_list)
                 self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[1])
                 text_encoder_output["negative_prompt_embeds"] = neg_prompt_embeds
@@ -293,8 +397,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         image_latents = self.vae.encode_vae_image(image.to(GET_DTYPE()))
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             del self.vae
-            torch_device_module.empty_cache()
-            gc.collect()
+            self.maybe_empty_cache()
         return {"image_latents": image_latents}
 
     @ProfilingContext4DebugL1(
@@ -309,8 +412,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         images = self.vae.decode(latents, self.input_info)
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             del self.vae
-            torch_device_module.empty_cache()
-            gc.collect()
+            self.maybe_empty_cache()
         return images
 
     def run(self, total_steps=None):
@@ -323,6 +425,9 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
                 self.model.scheduler.step_pre(step_index=step_index)
 
             with ProfilingContext4DebugL1("🚀 infer_main"):
+                # Example of torch trace profile:
+                # with TorchTraceProfileContext() as profile:
+                #    profile.run(self.model.infer, self.inputs)
                 self.model.infer(self.inputs)
 
             with ProfilingContext4DebugL1("step_post"):
@@ -338,16 +443,18 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             "16:9": [1664, 928],
             "9:16": [928, 1664],
             "1:1": [1328, 1328],
-            "4:3": [1472, 1140],
-            "3:4": [768, 1024],
+            "4:3": [1472, 1104],
+            "3:4": [1104, 1472],
+            "3:2": (1584, 1056),
+            "2:3": (1056, 1584),
         }
         as_maps = self.config.get("aspect_ratios", {})
         as_maps.update(default_aspect_ratios)
         max_size = self.config.get("max_custom_size", 1664)
         min_size = self.config.get("min_custom_size", 256)
 
-        if len(self.input_info.target_shape) == 2:
-            height, width = self.input_info.target_shape
+        if len(self.input_info.size) == 2:
+            height, width = self.input_info.size
             height, width = int(height), int(width)
             if width > max_size or height > max_size:
                 scale = max_size / max(width, height)
@@ -366,43 +473,38 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
 
         return None
 
-    def set_target_shape(self):
+    def set_latent_shape(self):
         # In disagg transformer mode, use the shape transmitted from encoder
         if self.config.get("disagg_mode") == "transformer" and getattr(self, "inputs", {}).get("latent_shape"):
             latent_shape = self.inputs["latent_shape"]
-            self.input_info.target_shape = tuple(latent_shape)
-            # Reconstruct auto_height and auto_width
+            self.input_info.latent_shape = tuple(latent_shape)
             scale_factor = self.config["vae_scale_factor"]
-            self.input_info.auto_height = latent_shape[-2] * scale_factor
-            self.input_info.auto_width = latent_shape[-1] * scale_factor
-            logger.info(f"Qwen Image Runner restored target shape from disagg: {latent_shape}")
-            return
-
-        custom_shape = self.get_custom_shape()
-        if custom_shape is not None:
-            width, height = custom_shape
+            self.input_info.size = [latent_shape[-2] * scale_factor, latent_shape[-1] * scale_factor]
+            logger.info(f"Qwen Image Runner restored latent shape from disagg: {latent_shape}")
         else:
-            width, height = self.input_info.original_size[-1]
-            calculated_width, calculated_height, _ = calculate_dimensions(self.resolution * self.resolution, width / height)
-            multiple_of = self.config["vae_scale_factor"] * 2
-            width = calculated_width // multiple_of * multiple_of
-            height = calculated_height // multiple_of * multiple_of
-        logger.info(f"Qwen Image Runner set target shape: {width}x{height}")
-        self.input_info.auto_width = width
-        self.input_info.auto_height = height
+            custom_shape = self.get_custom_shape()
+            if custom_shape is not None:
+                width, height = custom_shape
+            else:
+                width, height = self.input_info.original_size[-1]
+                calculated_width, calculated_height, _ = calculate_dimensions(self.resolution * self.resolution, width / height)
+                multiple_of = self.config["vae_scale_factor"] * 2
+                width = calculated_width // multiple_of * multiple_of
+                height = calculated_height // multiple_of * multiple_of
+            logger.info(f"Qwen Image Runner set target shape: {width}x{height}")
+            self.input_info.size = [height, width]
 
-        # VAE applies 8x compression on images but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
-        height = 2 * (int(height) // (self.config["vae_scale_factor"] * 2))
-        width = 2 * (int(width) // (self.config["vae_scale_factor"] * 2))
-        num_channels_latents = self.config["in_channels"] // 4
-        if not self.is_layered:
-            self.input_info.target_shape = (1, 1, num_channels_latents, height, width)
-        else:
-            self.input_info.target_shape = (1, self.layers + 1, num_channels_latents, height, width)
+            # VAE applies 8x compression on images but we must also account for packing which requires
+            # latent height and width to be divisible by 2.
+            height = 2 * (int(height) // (self.config["vae_scale_factor"] * 2))
+            width = 2 * (int(width) // (self.config["vae_scale_factor"] * 2))
+            num_channels_latents = self.config["in_channels"] // 4
+            if not self.is_layered:
+                self.input_info.latent_shape = (1, 1, num_channels_latents, height, width)
+            else:
+                self.input_info.latent_shape = (1, self.layers + 1, num_channels_latents, height, width)
 
-    def set_img_shapes(self):
-        width, height = self.input_info.auto_width, self.input_info.auto_height
+        height, width = self.input_info.size
         if self.config["task"] == "t2i":
             image_shapes = [[(1, height // self.config["vae_scale_factor"] // 2, width // self.config["vae_scale_factor"] // 2)]]
         elif self.config["task"] == "i2i":
@@ -434,7 +536,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
     def _save_images(self, images, input_info, log_prefix="Image saved"):
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-        if input_info.return_result_tensor:
+        if input_info.return_result_tensor or input_info.save_result_path is None:
             return
 
         image_prefix = input_info.save_result_path.rsplit(".", 1)[0]
@@ -453,39 +555,67 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             del latents
         if generator is not None:
             del generator
-        torch_device_module.empty_cache()
-        gc.collect()
+        self.maybe_empty_cache(collect_garbage=True)
 
         if input_info.return_result_tensor:
             return {"images": images}
         elif input_info.save_result_path is not None:
             return {"images": None}
 
-    def _run_pipeline_local(self, input_info):
-        self.inputs = self.run_input_encoder()
-        self.set_target_shape()
-        self.set_img_shapes()
-        logger.info(f"input_info: {self.input_info}")
-        latents, generator = self.run_dit()
-        images = self.run_vae_decoder(latents)
-        self.end_run()
-        self._save_images(images, input_info, log_prefix="Image saved")
-        return self._finalize_pipeline_outputs(input_info, images, latents=latents, generator=generator)
+    def reuse_key(self):
+        reuse_key = {
+            "prompt": self.input_info.prompt,
+            "negative_prompt": self.input_info.negative_prompt,
+        }
+        if self.config["task"] == "i2i":
+            reuse_key["image_path"] = self.input_info.image_path.split(",")
+        return reuse_key
 
-    def _run_pipeline_disagg_encoder(self):
+    def reuse_input_info(self):
+        input_info = {"txt_seq_lens": list(self.input_info.txt_seq_lens)}
+        if self.config["task"] == "i2i":
+            input_info["original_size"] = list(self.input_info.original_size)
+        return input_info
+
+    def _run_pipeline_local(self, input_info):
+        self.prepare_reuse_output()
+        try:
+            self.inputs = self.load_reused_inputs() if self.reuse else self.run_input_encoder()
+            self.stage_reuse_cache()
+            if self.config["task"] == "i2i" and "image_encoder_output" in self.inputs:
+                self.input_info.image_encoder_output = self.inputs["image_encoder_output"]
+            self.set_latent_shape()
+            logger.info(f"input_info: {self.input_info}")
+            latents, generator = self.run_dit()
+            images = self.run_vae_decoder(latents)
+            self.end_run()
+            self._save_images(images, input_info, log_prefix="Image saved")
+            result = self._finalize_pipeline_outputs(input_info, images, latents=latents, generator=generator)
+            self.commit_reuse_result()
+            return result
+        except Exception:
+            self.discard_reuse_result()
+            raise
+        finally:
+            if self.input_info is not None:
+                self.end_run()
+
+    def _run_pipeline_disagg_encoder(self, request_config):
         self.inputs = self.run_input_encoder()
-        self.set_target_shape()
-        self.set_img_shapes()
+        self.set_latent_shape()
         logger.info(f"input_info: {self.input_info}")
-        latent_shape = list(self.input_info.target_shape)
-        self.send_encoder_outputs(self.inputs, latent_shape)
+        request_config = self.build_disagg_request_config(self.input_info, request_config)
+        latent_shape = list(self.input_info.latent_shape)
+        self.send_encoder_outputs(self.inputs, latent_shape, request_config)
         logger.info("[Disagg] Encoder role completed. Skipping DiT run_main.")
         if GET_RECORDER_MODE():
             monitor_cli.lightx2v_worker_request_success.inc()
         return None
 
-    def _run_pipeline_disagg_transformer(self, input_info):
-        self.inputs = self.receive_encoder_outputs()
+    def _run_pipeline_disagg_transformer(self, input_info, request_config):
+        self.inputs = self.receive_encoder_outputs(request_config)
+        if self.config["task"] == "i2i" and "image_encoder_output" in self.inputs:
+            self.input_info.image_encoder_output = self.inputs["image_encoder_output"]
         prompt_embeds = self.inputs.get("text_encoder_output", {}).get("prompt_embeds")
         if prompt_embeds is not None:
             self.input_info.txt_seq_lens = [prompt_embeds.shape[1]]
@@ -493,8 +623,7 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
             if neg_embeds is not None:
                 self.input_info.txt_seq_lens.append(neg_embeds.shape[1])
 
-        self.set_target_shape()
-        self.set_img_shapes()
+        self.set_latent_shape()
         logger.info(f"input_info: {self.input_info}")
 
         latents, generator = self.run_dit()
@@ -510,25 +639,24 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
         self._save_images(images, input_info, log_prefix="Image saved")
         return self._finalize_pipeline_outputs(input_info, images, latents=latents, generator=generator)
 
-    def _run_pipeline_disagg_decode(self, input_info):
+    def _run_pipeline_disagg_decode(self, input_info, request_config):
         # Decoder role: receive DiT latents from Transformer, decode with VAE, save image
-        latents = self.receive_transformer_outputs()
+        latents = self.receive_transformer_outputs(request_config)
 
         scale_factor = self.config["vae_scale_factor"]
         p2_meta = getattr(self, "_p2_receive_meta", {})
-        auto_height = p2_meta.get("auto_height")
-        auto_width = p2_meta.get("auto_width")
-        if auto_height is None or auto_width is None:
+        target_height = p2_meta.get("auto_height")
+        target_width = p2_meta.get("auto_width")
+        if target_height is None or target_width is None:
             # Fallback for spatial-format latents (non-packed models)
             latent_h = latents.shape[-2]
             latent_w = latents.shape[-1]
-            auto_height = latent_h * scale_factor * 2
-            auto_width = latent_w * scale_factor * 2
-        self.input_info.auto_height = int(auto_height)
-        self.input_info.auto_width = int(auto_width)
+            target_height = latent_h * scale_factor * 2
+            target_width = latent_w * scale_factor * 2
+        self.input_info.size = [int(target_height), int(target_width)]
         # Compute image_shapes: number of spatial patches per image
-        h_patches = int(auto_height) // (scale_factor * 2)
-        w_patches = int(auto_width) // (scale_factor * 2)
+        h_patches = int(target_height) // (scale_factor * 2)
+        w_patches = int(target_width) // (scale_factor * 2)
         self.input_info.image_shapes = [[(1, h_patches, w_patches)]]
         images = self.run_vae_decoder(latents)
         self.end_run()
@@ -543,13 +671,20 @@ class QwenImageRunner(DisaggMixin, DefaultRunner):
 
     @ProfilingContext4DebugL1("RUN pipeline")
     def run_pipeline(self, input_info):
-        self.input_info = input_info
         disagg_mode = self.config.get("disagg_mode")
+        if disagg_mode in ("transformer", "decode"):
+            input_info.update(self._disagg_request_config or {})
+        self.input_info = input_info
+        request_config = self.build_disagg_request_config(input_info) if disagg_mode else None
 
-        if disagg_mode == "decode":
-            return self._run_pipeline_disagg_decode(input_info)
-        if disagg_mode == "encoder":
-            return self._run_pipeline_disagg_encoder()
-        if disagg_mode == "transformer":
-            return self._run_pipeline_disagg_transformer(input_info)
-        return self._run_pipeline_local(input_info)
+        try:
+            if disagg_mode == "decode":
+                return self._run_pipeline_disagg_decode(input_info, request_config)
+            if disagg_mode == "encoder":
+                return self._run_pipeline_disagg_encoder(request_config)
+            if disagg_mode == "transformer":
+                return self._run_pipeline_disagg_transformer(input_info, request_config)
+            return self._run_pipeline_local(input_info)
+        finally:
+            if disagg_mode:
+                self._disagg_request_config = None

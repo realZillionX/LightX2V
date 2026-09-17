@@ -21,7 +21,6 @@
 .log
 *.pid
 *.ipynb*
-*.mp4
 build/
 dist/
 .cache/
@@ -30,3 +29,10 @@ app/.gradio/
 *.pkl
 save_results/*
 *.egg-info/
+lightx2v_train/output_train/*
+lightx2v_train/output_infer/*
+lightx2v_ros/build
+lightx2v_ros/install
+lightx2v_ros/log
+.gitnexus
+lightx2v_kernel_xpu/_cmake_build

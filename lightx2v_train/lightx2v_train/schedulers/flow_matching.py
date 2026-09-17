@@ -1,0 +1,214 @@
+import math
+
+import torch
+
+from lightx2v_train.runtime.distributed import get_device
+from lightx2v_train.schedulers.time_shift import build_time_shift_mu
+from lightx2v_train.utils.utils import get_running_dtype
+
+
+class RectifiedFlowMatchingScheduler:
+    def __init__(self, config):
+        self.config = config
+        self.device = get_device()
+
+        scheduler_config = config["scheduler"]
+        self.num_train_timesteps = scheduler_config.get("num_train_timesteps", 1000)
+        self.timestep_distribution = scheduler_config.get("timestep_distribution", "logitnormal")
+
+        self.logitnormal_mean = scheduler_config.get("logitnormal_mean", 0.0)
+        self.logitnormal_std = scheduler_config.get("logitnormal_std", 1.0)
+        self.logitnormal_eps = scheduler_config.get("logitnormal_eps", 1e-3)
+        self.logitnormal_uniform_prob = scheduler_config.get("logitnormal_uniform_prob", 0.1)
+
+        self.min_sigma = float(scheduler_config.get("min_sigma", 0.001))
+        self.max_sigma = float(scheduler_config.get("max_sigma", 1.0))
+        if not 0.0 <= self.min_sigma < self.max_sigma <= 1.0:
+            raise ValueError(f"scheduler sigma bounds must satisfy 0 <= min_sigma < max_sigma <= 1, got [{self.min_sigma}, {self.max_sigma}].")
+
+        time_shift_settings = scheduler_config.get("time_shift_settings", {})
+        if time_shift_settings is None:
+            time_shift_settings = {}
+        if not isinstance(time_shift_settings, dict):
+            raise ValueError("scheduler.time_shift_settings must be a mapping.")
+        self.do_time_shift = time_shift_settings.get("do_time_shift", False)
+        self.time_shift_power = time_shift_settings.get("time_shift_power", 1.0)
+        self.shift_type = time_shift_settings.get("shift_type", "linear")
+        self.time_shift_mu = build_time_shift_mu(time_shift_settings)
+
+        self.running_dtype = get_running_dtype(config["model"]["running_dtype"])
+
+        # ==============================
+        # The following attributes are for inference only
+        # ==============================
+        self.infer_sigmas = None
+        self.infer_timesteps = None
+        self.num_inference_steps = None
+
+    def sample_timestep_or_sigma(self, latent_hw=None, seq_len=None):
+        if self.timestep_distribution == "logitnormal":
+            timestep_or_sigma = torch.randn((1,), device=self.device, dtype=torch.float32) * self.logitnormal_std + self.logitnormal_mean
+            timestep_or_sigma = torch.sigmoid(timestep_or_sigma)
+        elif self.timestep_distribution == "uniform":
+            timestep_or_sigma = torch.rand((1,), device=self.device)
+        elif self.timestep_distribution == "shifted_logit_normal":
+            if seq_len is None:
+                raise ValueError("scheduler.timestep_distribution='shifted_logit_normal' requires seq_len.")
+            timestep_or_sigma = self._sample_shifted_logit_normal(seq_len)
+        else:
+            raise ValueError(f"Unsupported timestep distribution: {self.timestep_distribution}")
+        timestep_or_sigma = self.time_shift(timestep_or_sigma, latent_hw=latent_hw)
+        return self.clamp_training_sigma(timestep_or_sigma).to(self.running_dtype)
+
+    def clamp_training_sigma(self, sigma):
+        """Clamp training noise after time shifting; generation schedules are unaffected."""
+        return sigma.clamp(self.min_sigma, self.max_sigma)
+
+    def _sample_shifted_logit_normal(self, seq_len):
+        mu = self._get_shift_for_sequence_length(seq_len)
+        normal = torch.randn((1,), device=self.device, dtype=torch.float32) * self.logitnormal_std + mu
+        samples = torch.sigmoid(normal)
+
+        upper = torch.sigmoid(torch.tensor(mu + 3.0902 * self.logitnormal_std, device=self.device, dtype=torch.float32))
+        lower = torch.sigmoid(torch.tensor(mu - 2.5758 * self.logitnormal_std, device=self.device, dtype=torch.float32))
+        stretched = (samples - lower) / (upper - lower)
+        stretched = torch.where(stretched >= self.logitnormal_eps, stretched, 2 * self.logitnormal_eps - stretched)
+        stretched = torch.clamp(stretched, 0, 1)
+
+        uniform = (1 - self.logitnormal_eps) * torch.rand((1,), device=self.device, dtype=torch.float32) + self.logitnormal_eps
+        choose_shifted = torch.rand((1,), device=self.device) > self.logitnormal_uniform_prob
+        return torch.where(choose_shifted, stretched, uniform)
+
+    @staticmethod
+    def _get_shift_for_sequence_length(seq_len, min_tokens=1024, max_tokens=4096, min_shift=0.95, max_shift=2.05):
+        slope = (max_shift - min_shift) / (max_tokens - min_tokens)
+        return slope * seq_len + (min_shift - slope * min_tokens)
+
+    def time_shift(self, t, latent_hw=None, num_steps=None):
+        if not self.do_time_shift:
+            return t
+        mu = self.time_shift_mu(latent_hw=latent_hw, num_steps=num_steps)
+        if self.shift_type == "exponential":
+            mu = math.exp(mu)
+        return mu / (mu + (1 / t - 1) ** self.time_shift_power)
+
+    def add_noise(self, latent, noise, sigmas):
+        sigmas = self._expand_to_ndim(sigmas, latent.ndim)
+        return (1.0 - sigmas) * latent + sigmas * noise
+
+    def build_train_gt(self, latent, noise):
+        return noise - latent
+
+    def _expand_to_ndim(self, values, ndim):
+        if values.ndim == 0:
+            values = values.reshape(1)
+        return values.reshape(values.shape[0], *([1] * (ndim - 1)))
+
+    # ==============================
+    # The following methods are for inference only
+    # ==============================
+    def build_inference_sigmas(self, num_inference_steps, sigmas=None, latent_hw=None):
+        """Build an immutable inference schedule without changing scheduler state."""
+        num_inference_steps = int(num_inference_steps)
+        if num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}.")
+        if sigmas is None:
+            sigmas = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+            if self.do_time_shift:
+                sigmas = self.time_shift(sigmas, latent_hw=latent_hw, num_steps=num_inference_steps)
+        else:
+            sigmas = torch.tensor(sigmas, dtype=torch.float32)
+            if sigmas.ndim != 1 or sigmas.numel() != num_inference_steps:
+                raise ValueError(f"sigmas must contain exactly {num_inference_steps} values, got shape {tuple(sigmas.shape)}.")
+        return torch.cat([sigmas, torch.zeros(1)]).to(self.device)
+
+    def set_timesteps(self, num_inference_steps, sigmas=None, latent_hw=None):
+        self.num_inference_steps = int(num_inference_steps)
+        self.infer_sigmas = self.build_inference_sigmas(
+            self.num_inference_steps,
+            sigmas=sigmas,
+            latent_hw=latent_hw,
+        )
+        self.infer_timesteps = self.infer_sigmas[:-1] * self.num_train_timesteps
+
+    def step(self, model_output, step_index, latent):
+        f"""
+        ADD NOISE:
+            x_t = (1 - sigma_t) * x_0 + sigma_t * N  ------ self.add_noise(...)
+            =>  x_t = sigma_t * (N - x_0) + x_0
+            =>  x_t = sigma_t * v + x_0
+        REMOVE NOISE:
+            x_t = sigma_t * v + x_0
+            x_t-1 = sigma_t-1 * v + x_0
+            =>  x_t - x_t-1 = (sigma_t - sigma_t-1) * v
+            =>  x_t-1 = x_t + (sigma_t-1 - sigma_t) * v
+            =>  x_t-1 = x_t + (sigma_next - sigma) * model_output  ------------------------ (*)
+        """
+        sigma = self.infer_sigmas[step_index]
+        sigma_next = self.infer_sigmas[step_index + 1]
+        prev_sample = latent + (sigma_next - sigma) * model_output  # --------------------- (*) from above
+        return prev_sample
+
+
+class CausalForcingFlowMatchScheduler(RectifiedFlowMatchingScheduler):
+    def __init__(self, config):
+        super().__init__(config)
+        time_shift_settings = config["scheduler"].get("time_shift_settings") or {}
+        self.sigma_min = float(time_shift_settings.get("sigma_min", 0.0))
+        self.extra_one_step = bool(time_shift_settings.get("extra_one_step", True))
+        self.set_timesteps(self.num_train_timesteps, training=True)
+
+    def set_timesteps(self, num_inference_steps=1000, denoising_strength=1.0, training=False):
+        sigma_start = self.sigma_min + (1.0 - self.sigma_min) * denoising_strength
+        num_steps = num_inference_steps + 1 if self.extra_one_step else num_inference_steps
+        sigmas = torch.linspace(sigma_start, self.sigma_min, num_steps)
+        if self.extra_one_step:
+            sigmas = sigmas[:-1]
+        self.sigmas = self.time_shift(sigmas, num_steps=num_inference_steps)
+        self.timesteps = self.sigmas * self.num_train_timesteps
+        if training:
+            x = self.timesteps
+            y = torch.exp(-2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2)
+            y_shifted = y - y.min()
+            self.linear_timesteps_weights = y_shifted * (num_inference_steps / y_shifted.sum())
+
+    def sample_chunkwise(self, num_frames, num_frame_per_chunk, device, dtype):
+        index = torch.randint(
+            0,
+            self.num_train_timesteps,
+            (1, num_frames),
+            device=device,
+            dtype=torch.long,
+        )
+        index = index.reshape(1, -1, num_frame_per_chunk)
+        index[:, :, 1:] = index[:, :, 0:1]
+        index = index.reshape(1, num_frames)
+
+        sigmas = self.clamp_training_sigma(self.sigmas.to(device=device)[index]).to(dtype=dtype)
+        weights = self.linear_timesteps_weights.to(device=device, dtype=torch.float32)[index]
+        return sigmas, weights
+
+    def sample_clean_augmentation(self, num_frames, num_frame_per_chunk, max_timestep, device, dtype):
+        max_timestep = int(max_timestep)
+        if not 0 < max_timestep <= self.num_train_timesteps:
+            raise ValueError(f"max_timestep must be in [1, {self.num_train_timesteps}], got {max_timestep}.")
+
+        # The training schedule is stored from noisy to clean. A maximum
+        # augmentation timestep therefore selects from the clean tail rather
+        # than using the timestep directly as a lower schedule index.
+        min_schedule_index = self.num_train_timesteps - max_timestep
+        index = torch.randint(
+            min_schedule_index,
+            self.num_train_timesteps,
+            (1, num_frames),
+            device=device,
+            dtype=torch.long,
+        )
+        index = index.reshape(1, -1, num_frame_per_chunk)
+        index[:, :, 1:] = index[:, :, 0:1]
+        index = index.reshape(1, num_frames)
+        return self.clamp_training_sigma(self.sigmas.to(device=device)[index]).to(dtype=dtype)
+
+    def add_noise(self, latent, noise, sigmas):
+        sigmas = sigmas.reshape(sigmas.shape[0], 1, sigmas.shape[1], 1, 1)
+        return (1.0 - sigmas) * latent + sigmas * noise

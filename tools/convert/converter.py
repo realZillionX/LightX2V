@@ -2,6 +2,7 @@ import argparse
 import gc
 import glob
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -10,6 +11,7 @@ import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 from loguru import logger
@@ -22,13 +24,22 @@ quant_path = str(Path(__file__).parent / "quant")
 if quant_path not in sys.path:
     sys.path.insert(0, quant_path)
 
+from h3_fp8_f16_accum import (  # noqa: E402
+    FP8_F16_ACCUM_QUANTIZATION_PROFILE,
+    create_h3_fp8_f16_accum_quantization,
+)
 from quant import *  # noqa: E402
 
 from lightx2v.utils.lora_loader import LoRALoader  # noqa: E402
 from lightx2v.utils.registry_factory import CONVERT_WEIGHT_REGISTER  # noqa: E402
+from tools.convert.h3_video_vae_encoder import (  # noqa: E402
+    FP8_ENCODER_CONV_MODES,
+    convert_h3_video_vae_encoder_fp8,
+)
 
 dtype_mapping = {
     "int8": torch.int8,
+    "int8-convrot": torch.int8,
     "fp8": torch.float8_e4m3fn,
 }
 
@@ -307,6 +318,10 @@ def get_key_mapping_rules(direction, model_type):
             return [rule["backward"] for rule in unified_rules]
         else:
             raise ValueError(f"Invalid direction: {direction}")
+    elif model_type in {"h3", "h3_video_vae_decoder"}:
+        # MiniMax-H3 transformer and Video VAE decoder checkpoints already use
+        # LightX2V's runtime keys.
+        return []
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -321,8 +336,10 @@ def quantize_model(
     ignore_quant_keys=None,
     linear_type="int8",
     non_linear_dtype=torch.float,
+    preserve_non_quant_dtype=False,
     comfyui_mode=False,
     comfyui_keys=[],
+    quantization_policy=None,
 ):
     """
     Quantize model weights in-place
@@ -353,7 +370,7 @@ def quantize_model(
 
             # Skip non-tensors and non-2D tensors
             if not isinstance(tensor, torch.Tensor) or tensor.dim() != 2:
-                if tensor.dtype != non_linear_dtype:
+                if not preserve_non_quant_dtype and tensor.dtype != non_linear_dtype:
                     weights[key] = tensor.to(non_linear_dtype)
                     non_quantized_size += weights[key].numel() * weights[key].element_size()
                 else:
@@ -367,13 +384,13 @@ def quantize_model(
                 pass
             elif len(parts) < key_idx + 1 or parts[key_idx] not in target_keys:
                 if adapter_keys is None:
-                    if tensor.dtype != non_linear_dtype:
+                    if not preserve_non_quant_dtype and tensor.dtype != non_linear_dtype:
                         weights[key] = tensor.to(non_linear_dtype)
                         non_quantized_size += weights[key].numel() * weights[key].element_size()
                     else:
                         non_quantized_size += tensor.numel() * tensor.element_size()
                 elif not any(adapter_key in parts for adapter_key in adapter_keys):
-                    if tensor.dtype != non_linear_dtype:
+                    if not preserve_non_quant_dtype and tensor.dtype != non_linear_dtype:
                         weights[key] = tensor.to(non_linear_dtype)
                         non_quantized_size += weights[key].numel() * weights[key].element_size()
                     else:
@@ -386,7 +403,7 @@ def quantize_model(
             if ignore_quant_keys is not None and any(ig_q in key for ig_q in ignore_quant_keys):
                 original_tensor_size = tensor.numel() * tensor.element_size()
                 original_size += original_tensor_size
-                if tensor.dtype != non_linear_dtype:
+                if not preserve_non_quant_dtype and tensor.dtype != non_linear_dtype:
                     weights[key] = tensor.to(non_linear_dtype)
                     non_quantized_size += weights[key].numel() * weights[key].element_size()
                 else:
@@ -399,8 +416,12 @@ def quantize_model(
 
             # Quantize tensor and store results
             quantizer = CONVERT_WEIGHT_REGISTER[linear_type](tensor)
-            w_q, scales, extra = quantizer.weight_quant_func(tensor, comfyui_mode)
+            if quantization_policy is None:
+                w_q, scales, extra = quantizer.weight_quant_func(tensor, comfyui_mode)
+            else:
+                w_q, scales, extra = quantization_policy.quantize_weight(key, tensor, quantizer.weight_quant_func)
             weight_global_scale = extra.get("weight_global_scale", None)  # For nvfp4
+            convrot_groupsize = extra.get("convrot_groupsize", None)
 
             # Replace original tensor and store scales
             weights[key] = w_q
@@ -410,10 +431,13 @@ def quantize_model(
                 weights[key + "_scale"] = scales
             if weight_global_scale:
                 weights[key + "_global_scale"] = weight_global_scale
+            if convrot_groupsize is not None:
+                weights[key.removesuffix(".weight") + ".convrot_groupsize"] = convrot_groupsize
 
             quantized_tensor_size = w_q.numel() * w_q.element_size()
             scale_size = scales.numel() * scales.element_size()
-            quantized_size += quantized_tensor_size + scale_size
+            extra_size = 0 if convrot_groupsize is None else convrot_groupsize.numel() * convrot_groupsize.element_size()
+            quantized_size += quantized_tensor_size + scale_size + extra_size
 
             total_quantized += 1
             del w_q, scales
@@ -436,13 +460,63 @@ def quantize_model(
     logger.info(f"Total final model size: {total_final_size_mb:.2f} MB")
     logger.info(f"Size reduction in quantized tensors: {size_reduction_mb:.2f} MB ({size_reduction_mb / original_size_mb * 100:.1f}%)")
 
+    if quantization_policy is not None:
+        quantization_policy.validate()
     if comfyui_mode:
         weights["scaled_fp8"] = torch.zeros(2, dtype=torch.float8_e4m3fn)
 
     return weights
 
 
-def load_loras(lora_path, weight_dict, alpha, key_mapping_rules=None, strength=1.0):
+def _validate_lora_merge(lora_path, weight_dict, lora_weights, lora_pairs, lora_diffs, alpha, require_alpha):
+    """Validate a LoRA completely before modifying any base-model tensors."""
+    if not lora_pairs and not lora_diffs:
+        raise ValueError(f"No supported LoRA weights found in: {lora_path}")
+
+    consumed_keys = set()
+    for pair_info in lora_pairs.values():
+        consumed_keys.update((pair_info["up_key"], pair_info["down_key"]))
+        if pair_info["mid_key"] is not None:
+            consumed_keys.add(pair_info["mid_key"])
+    consumed_keys.update(diff_info["diff_key"] for diff_info in lora_diffs.values())
+
+    tensor_keys = {key for key in lora_weights if not key.endswith(".alpha")}
+    unsupported_keys = sorted(tensor_keys - consumed_keys)
+    missing_model_keys = sorted((set(lora_pairs) | set(lora_diffs)) - set(weight_dict))
+    missing_alpha_keys = sorted(model_key for model_key, pair_info in lora_pairs.items() if pair_info["alpha"] is None)
+
+    shape_mismatches = []
+    for model_key, pair_info in lora_pairs.items():
+        if model_key not in weight_dict:
+            continue
+        param = weight_dict[model_key]
+        lora_up = lora_weights[pair_info["up_key"]]
+        lora_down = lora_weights[pair_info["down_key"]]
+        if lora_up.dim() != 2 or lora_down.dim() != 2:
+            shape_mismatches.append(f"{model_key}: up={tuple(lora_up.shape)}, down={tuple(lora_down.shape)}")
+            continue
+        expected_shape = (lora_up.shape[0], lora_down.shape[1])
+        if lora_up.shape[1] != lora_down.shape[0] or tuple(param.shape) != expected_shape:
+            shape_mismatches.append(f"{model_key}: base={tuple(param.shape)}, up={tuple(lora_up.shape)}, down={tuple(lora_down.shape)}")
+
+    for model_key, diff_info in lora_diffs.items():
+        if model_key in weight_dict and tuple(weight_dict[model_key].shape) != tuple(lora_weights[diff_info["diff_key"]].shape):
+            shape_mismatches.append(f"{model_key}: base={tuple(weight_dict[model_key].shape)}, diff={tuple(lora_weights[diff_info['diff_key']].shape)}")
+
+    problems = []
+    if unsupported_keys:
+        problems.append(f"unsupported tensors ({len(unsupported_keys)}): {unsupported_keys[:3]}")
+    if missing_model_keys:
+        problems.append(f"missing base-model keys ({len(missing_model_keys)}): {missing_model_keys[:3]}")
+    if shape_mismatches:
+        problems.append(f"shape mismatches ({len(shape_mismatches)}): {shape_mismatches[:3]}")
+    if require_alpha and alpha is None and missing_alpha_keys:
+        problems.append(f"alpha is missing for {len(missing_alpha_keys)} LoRA pairs; pass --lora_alpha with the training alpha (8 for the MiniMax-H3 Turbo LoRA)")
+    if problems:
+        raise ValueError(f"LoRA validation failed for {lora_path}: " + "; ".join(problems))
+
+
+def load_loras(lora_path, weight_dict, alpha, key_mapping_rules=None, strength=1.0, strict=False, require_alpha=False):
     """
     Load and apply LoRA weights to model weights using the LoRALoader class.
 
@@ -452,7 +526,16 @@ def load_loras(lora_path, weight_dict, alpha, key_mapping_rules=None, strength=1
         alpha: Global alpha scaling factor
         key_mapping_rules: Optional list of (pattern, replacement) regex rules for key mapping
         strength: Additional strength factor for LoRA deltas
+        strict: Fail instead of producing a partially merged checkpoint
+        require_alpha: Require a global or per-layer alpha for every LoRA pair
+
+    Returns:
+        Number of LoRA weight adjustments applied
     """
+    if alpha is not None and not math.isfinite(alpha):
+        raise ValueError(f"LoRA alpha must be finite, got {alpha}")
+    if strength is not None and not math.isfinite(strength):
+        raise ValueError(f"LoRA strength must be finite, got {strength}")
     logger.info(f"Loading LoRA from: {lora_path} with alpha={alpha}, strength={strength}")
 
     # Load LoRA weights from safetensors file
@@ -462,22 +545,159 @@ def load_loras(lora_path, weight_dict, alpha, key_mapping_rules=None, strength=1
     # Create LoRA loader with key mapping rules
     lora_loader = LoRALoader(key_mapping_rules=key_mapping_rules)
 
+    lora_pairs = lora_loader.extract_lora_pairs(lora_weights)
+    lora_diffs = lora_loader.extract_lora_diffs(lora_weights)
+    if strict:
+        _validate_lora_merge(
+            lora_path=lora_path,
+            weight_dict=weight_dict,
+            lora_weights=lora_weights,
+            lora_pairs=lora_pairs,
+            lora_diffs=lora_diffs,
+            alpha=alpha,
+            require_alpha=require_alpha,
+        )
+
     # Apply LoRA weights to model
-    lora_loader.apply_lora(
+    applied_count = lora_loader.apply_lora(
         weight_dict=weight_dict,
         lora_weights=lora_weights,
         alpha=alpha,
         strength=strength,
     )
+    expected_count = len(lora_pairs) + len(lora_diffs)
+    if strict and applied_count != expected_count:
+        raise RuntimeError(f"LoRA merge was incomplete for {lora_path}: applied {applied_count} of {expected_count} adjustments")
+    return applied_count
+
+
+H3_TEXT_ENCODER_LAYER_COUNT = 50
+H3_TEXT_ENCODER_PREFIX = "model.language_model"
+H3_TEXT_ENCODER_LINEAR_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+)
+H3_TEXT_ENCODER_NORM_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+)
+
+
+def h3_text_encoder_weight_names(layer_count=H3_TEXT_ENCODER_LAYER_COUNT):
+    layer_prefixes = [f"{H3_TEXT_ENCODER_PREFIX}.layers.{index}" for index in range(layer_count)]
+    quantized_names = {f"{prefix}.{suffix}" for prefix in layer_prefixes for suffix in H3_TEXT_ENCODER_LINEAR_SUFFIXES}
+    required_names = quantized_names | {f"{prefix}.{suffix}" for prefix in layer_prefixes for suffix in H3_TEXT_ENCODER_NORM_SUFFIXES}
+    required_names.add(f"{H3_TEXT_ENCODER_PREFIX}.embed_tokens.weight")
+    return required_names, quantized_names
+
+
+def convert_minimax_h3_text_encoder_fp8(args):
+    """Build the LightX2V MiniMax-H3 50-layer text-prefix FP8 checkpoint."""
+    if not args.quantized or args.linear_type != "fp8":
+        raise ValueError("h3_text_encoder conversion requires --quantized --linear_type fp8")
+    if args.output_ext != ".safetensors" or not args.single_file:
+        raise ValueError("h3_text_encoder conversion requires --output_ext .safetensors --single_file")
+    if args.direction is not None or args.lora_path is not None:
+        raise ValueError("h3_text_encoder FP8 conversion does not support key conversion or LoRA merging")
+
+    output_root = Path(args.output)
+    output_path = output_root / f"{args.output_name}{args.output_ext}"
+    if output_path.exists():
+        raise FileExistsError(f"Refusing to overwrite an existing output: {output_path}")
+
+    source_root = Path(args.source)
+    index_path = source_root / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"MiniMax-H3 text encoder index was not found: {index_path}")
+    with index_path.open("r", encoding="utf-8") as handle:
+        weight_map = json.load(handle).get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Invalid safetensors index without a weight_map: {index_path}")
+
+    required_names, quantized_names = h3_text_encoder_weight_names()
+    missing = sorted(required_names - weight_map.keys())
+    if missing:
+        raise KeyError(f"MiniMax-H3 text encoder is missing {len(missing)} required tensors: {missing[:8]}")
+
+    names_by_shard = defaultdict(list)
+    for name in sorted(required_names):
+        names_by_shard[weight_map[name]].append(name)
+    missing_shards = [name for name in names_by_shard if not (source_root / name).is_file()]
+    if missing_shards:
+        raise FileNotFoundError(f"MiniMax-H3 text encoder is missing checkpoint shards: {missing_shards}")
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    converted_weights = {}
+    device = torch.device(args.device)
+    quantizer_type = CONVERT_WEIGHT_REGISTER["fp8"]
+    for shard_index, shard_name in enumerate(sorted(names_by_shard), start=1):
+        shard_path = source_root / shard_name
+        logger.info("Processing MiniMax-H3 text shard {}/{}: {}", shard_index, len(names_by_shard), shard_path.name)
+        with safe_open(shard_path, framework="pt", device="cpu") as checkpoint:
+            for name in tqdm(names_by_shard[shard_name], desc=shard_path.name, leave=False):
+                tensor = checkpoint.get_tensor(name)
+                if tensor.dtype != torch.bfloat16:
+                    raise ValueError(f"Expected BF16 source tensor for {name}, got {tensor.dtype}")
+                if name not in quantized_names:
+                    converted_weights[name] = tensor.clone()
+                else:
+                    weight = tensor.to(device=device, dtype=torch.float32)
+                    quantizer = quantizer_type(weight)
+                    weight_fp8, weight_scale, _ = quantizer.weight_quant_func(weight)
+                    converted_weights[name] = weight_fp8.cpu().contiguous()
+                    converted_weights[f"{name}_scale"] = weight_scale.float().cpu().contiguous()
+                    del weight, quantizer, weight_fp8, weight_scale
+                del tensor
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    total_size = sum(tensor.numel() * tensor.element_size() for tensor in converted_weights.values())
+    logger.info(
+        "Saving MiniMax-H3 text FP8 checkpoint: {} tensors, {:.2f} GiB -> {}",
+        len(converted_weights),
+        total_size / (1024**3),
+        output_path,
+    )
+    with TemporaryDirectory(prefix=f".{args.output_name}.", dir=output_root) as temporary_dir:
+        temporary_path = Path(temporary_dir) / output_path.name
+        st.save_file(
+            converted_weights,
+            temporary_path,
+            metadata={
+                "format": "pt",
+                "model": "MiniMax-H3 text encoder prefix (layers 0-49)",
+                "quantization": "fp8-sgl",
+            },
+        )
+        os.replace(temporary_path, output_path)
+    logger.info("MiniMax-H3 text FP8 checkpoint saved successfully: {}", output_path)
 
 
 def convert_weights(args):
+    if args.model_type == "h3_text_encoder":
+        convert_minimax_h3_text_encoder_fp8(args)
+        return
+    if args.model_type == "h3_video_vae_encoder":
+        convert_h3_video_vae_encoder_fp8(args)
+        return
+
     if os.path.isdir(args.source):
-        src_files = glob.glob(os.path.join(args.source, "*.safetensors"), recursive=True)
+        src_files = sorted(glob.glob(os.path.join(args.source, "*.safetensors"), recursive=True))
     elif args.source.endswith((".pth", ".safetensors", "pt")):
         src_files = [args.source]
     else:
         raise ValueError("Invalid input path")
+    if not src_files:
+        raise FileNotFoundError(f"No model weight files found under: {args.source}")
 
     merged_weights = {}
     logger.info(f"Processing source files: {src_files}")
@@ -593,7 +813,16 @@ def convert_weights(args):
             # Pass key mapping rules to handle converted keys properly
             strength = args.lora_strength[idx] if args.lora_strength is not None else 1.0
             alpha = args.lora_alpha[idx] if args.lora_alpha is not None else None
-            load_loras(path, converted_weights, alpha, key_mapping_rules, strength=strength)
+            strict_lora = args.model_type == "h3"
+            load_loras(
+                path,
+                converted_weights,
+                alpha,
+                key_mapping_rules,
+                strength=strength,
+                strict=strict_lora,
+                require_alpha=strict_lora,
+            )
 
     if args.quantized:
         if args.full_quantized and args.comfyui_mode:
@@ -612,9 +841,18 @@ def convert_weights(args):
                 ignore_quant_keys=args.ignore_quant_keys,
                 linear_type=args.linear_type,
                 non_linear_dtype=args.non_linear_dtype,
+                preserve_non_quant_dtype=getattr(args, "preserve_non_quant_dtype", False),
                 comfyui_mode=args.comfyui_mode,
                 comfyui_keys=args.comfyui_keys,
+                quantization_policy=args.quantization_policy,
             )
+            if args.model_type == "h3_video_vae_decoder" and args.linear_type == "fp8":
+                # FP8 decoder linears require FP16 bias; preserve other VAE tensors.
+                for key in converted_weights:
+                    if key.startswith("decoder.") and key.endswith(".weight_scale"):
+                        bias_key = key.removesuffix(".weight_scale") + ".bias"
+                        if bias_key in converted_weights:
+                            converted_weights[bias_key] = converted_weights[bias_key].to(torch.float16)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -639,7 +877,8 @@ def convert_weights(args):
                     logger.warning("Consider using --save_by_block or default chunked saving for better memory efficiency.")
 
                 # Save the entire model as a single file
-                st.save_file(converted_weights, output_path)
+                metadata = args.quantization_policy.metadata if args.quantization_policy is not None else None
+                st.save_file(converted_weights, output_path, metadata=metadata)
                 logger.info(f"Model saved successfully to: {output_path} ({total_size_gb:.2f}GB)")
 
             except MemoryError:
@@ -762,7 +1001,21 @@ def main():
     parser.add_argument(
         "-t",
         "--model_type",
-        choices=["wan_dit", "hunyuan_dit", "wan_t5", "wan_clip", "wan_animate_dit", "qwen_image_dit", "qwen25vl_llm", "z_image_dit", "self_forcing"],
+        choices=[
+            "wan_dit",
+            "h3",
+            "h3_video_vae_decoder",
+            "h3_video_vae_encoder",
+            "h3_text_encoder",
+            "hunyuan_dit",
+            "wan_t5",
+            "wan_clip",
+            "wan_animate_dit",
+            "qwen_image_dit",
+            "qwen25vl_llm",
+            "z_image_dit",
+            "self_forcing",
+        ],
         default="wan_dit",
         help="Model type",
     )
@@ -798,7 +1051,9 @@ def main():
     parser.add_argument("--comfyui_mode", action="store_true")
     parser.add_argument("--full_quantized", action="store_true")
     parser.add_argument("--quantized", action="store_true")
+    parser.add_argument("--quantization_profile", choices=[FP8_F16_ACCUM_QUANTIZATION_PROFILE])
     parser.add_argument("--bits", type=int, default=8, choices=[8], help="Quantization bit width")
+    parser.add_argument("--vae_encoder_conv_mode", choices=FP8_ENCODER_CONV_MODES)
     parser.add_argument(
         "--device",
         type=str,
@@ -808,7 +1063,7 @@ def main():
     parser.add_argument(
         "--linear_type",
         type=str,
-        choices=["int8", "fp8", "nvfp4", "mxfp4", "mxfp6", "mxfp8"],
+        choices=["int8", "int8-convrot", "fp8", "nvfp4", "mxfp4", "mxfp6", "mxfp8"],
         help="Quant type for linear",
     )
     parser.add_argument(
@@ -818,18 +1073,18 @@ def main():
         choices=["torch.bfloat16", "torch.float16"],
         help="Data type for non-linear",
     )
-    parser.add_argument("--lora_path", type=str, nargs="*", help="Path(s) to LoRA file(s). Can specify multiple paths separated by spaces.")
+    parser.add_argument("--lora_path", type=str, nargs="+", help="Path(s) to LoRA file(s). Can specify multiple paths separated by spaces.")
     parser.add_argument(
         "--lora_alpha",
         type=float,
-        nargs="*",
+        nargs="+",
         default=None,
-        help="Alpha for LoRA weight scaling, Default non scaling. ",
+        help="Alpha used for LoRA scaling (alpha/rank). Required for MiniMax-H3.",
     )
     parser.add_argument(
         "--lora_strength",
         type=float,
-        nargs="*",
+        nargs="+",
         help="Additional strength factor(s) for LoRA deltas; default 1.0",
     )
     parser.add_argument("--copy_no_weight_files", action="store_true")
@@ -851,6 +1106,14 @@ def main():
     if args.single_file and args.chunk_size > 0 and args.chunk_size != 100:
         logger.warning("--chunk_size is ignored when using --single_file option.")
 
+    if args.quantized and args.linear_type is None:
+        parser.error("--linear_type is required when --quantized is enabled (use --linear_type fp8 for MiniMax-H3 FP8)")
+    if args.linear_type == "int8-convrot" and args.comfyui_mode:
+        parser.error("--linear_type int8-convrot produces a LightX2V checkpoint and cannot be combined with --comfyui_mode")
+
+    if args.model_type == "h3" and args.lora_path and args.lora_alpha is None:
+        parser.error("MiniMax-H3 LoRA merging requires --lora_alpha; use --lora_alpha 8 for the MiniMax-H3 Turbo LoRA")
+
     def _parse_csv_override(v: str | None) -> list[str] | None:
         if v is None:
             return None
@@ -859,7 +1122,7 @@ def main():
             return None
         return [x.strip() for x in v.split(",") if x.strip()]
 
-    if args.quantized:
+    if args.quantized and args.model_type not in {"h3_text_encoder", "h3_video_vae_encoder"}:
         args.linear_dtype = dtype_mapping.get(args.linear_type, None)
         args.non_linear_dtype = eval(args.non_linear_dtype)
 
@@ -882,6 +1145,21 @@ def main():
                 "key_idx": 2,
                 "target_keys": ["self_attn", "cross_attn", "ffn"],
                 "ignore_key": ["ca", "audio"],
+            },
+            "h3": {
+                "key_idx": 2,
+                "target_keys": ["attn", "ff", "adaln_proj"],
+                "ignore_key": None,
+                # H3 deliberately mixes BF16 transformer tensors with FP32
+                # input/time/output projections. Preserve that precision for
+                # every tensor outside the quantized block linears.
+                "preserve_non_quant_dtype": True,
+            },
+            "h3_video_vae_decoder": {
+                "key_idx": 1,
+                "target_keys": ["transformer_blocks", "proj_out"],
+                "ignore_key": None,
+                "preserve_non_quant_dtype": True,
             },
             "self_forcing": {
                 "key_idx": 3,
@@ -931,12 +1209,14 @@ def main():
             args.key_idx = model_type_keys_map[args.model_type]["key_idx"]
             args.ignore_key = model_type_keys_map[args.model_type]["ignore_key"]
             args.comfyui_keys = model_type_keys_map[args.model_type]["comfyui_keys"] if "comfyui_keys" in model_type_keys_map[args.model_type] else None
+            args.preserve_non_quant_dtype = model_type_keys_map[args.model_type].get("preserve_non_quant_dtype", False)
         else:
             args.target_keys = None
             args.adapter_keys = None
             args.key_idx = None
             args.ignore_key = None
             args.comfyui_keys = None
+            args.preserve_non_quant_dtype = False
 
         # Apply CLI overrides (if provided)
         if args.key_idx_override is not None:
@@ -956,6 +1236,15 @@ def main():
             args.ignore_quant_keys = ignore_quant_keys_ov
         else:
             args.ignore_quant_keys = None
+
+    args.quantization_policy = None
+    if args.quantization_profile is not None:
+        if not args.quantized or args.linear_type != "fp8" or not args.single_file or args.output_ext != ".safetensors" or args.comfyui_mode:
+            parser.error("H3 FP8-F16 accumulation conversion requires --quantized --linear_type fp8 --output_ext .safetensors --single_file without --comfyui_mode")
+        try:
+            args.quantization_policy = create_h3_fp8_f16_accum_quantization(args.quantization_profile, args.model_type)
+        except ValueError as profile_error:
+            parser.error(str(profile_error))
 
     if os.path.isfile(args.output):
         raise ValueError("Output path must be a directory, not a file")

@@ -1,9 +1,12 @@
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from einops import rearrange
 from torch import nn
+
+from lightx2v.common.ops.rope import RopeTemplate
+from lightx2v.utils.registry_factory import ROPE_REGISTER
 
 from .cache import Cache
 from .rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -57,6 +60,33 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
         q = rearrange(q, "b h T H W d -> b h (T H W) d")
         k = rearrange(k, "b h T H W d -> b h (T H W) d")
         return q, k
+
+
+class NaRotaryEmbedding3d(RotaryEmbedding3d):
+    def forward(
+        self,
+        q: torch.FloatTensor,
+        k: torch.FloatTensor,
+        shape: torch.LongTensor,
+        cache: Cache,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        freqs = cache("rope_freqs_3d", lambda: self.get_freqs(shape))
+        if freqs.device != q.device:
+            freqs = freqs.to(device=q.device, dtype=q.dtype)
+        q = rearrange(q, "L h d -> h L d")
+        k = rearrange(k, "L h d -> h L d")
+        q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
+        k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
+        q = rearrange(q, "h L d -> L h d")
+        k = rearrange(k, "h L d -> L h d")
+        return q, k
+
+    def get_freqs(self, shape: torch.LongTensor) -> torch.Tensor:
+        freq_list = []
+        for f, h, w in shape.tolist():
+            freqs = self.get_axial_freqs(f, h, w)
+            freq_list.append(freqs.view(-1, freqs.size(-1)))
+        return torch.cat(freq_list, dim=0)
 
 
 class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
@@ -134,11 +164,35 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         return torch.cat(vid_freq_list, dim=0), torch.cat(txt_freq_list, dim=0)
 
 
-def get_na_rope(rope_type: Optional[str], dim: int):
-    if rope_type is None:
-        return None
-    if rope_type == "torch":
-        return None
-    if rope_type == "mmrope3d":
-        return NaMMRotaryEmbedding3d(dim=dim)
-    raise NotImplementedError(f"{rope_type} is not supported.")
+class SeedVRRopeBase(RopeTemplate):
+    multimodal = False
+    implementation_class = None
+
+    def __init__(self, layout="interleaved", compute_dtype=torch.float32):
+        super().__init__(layout=layout, compute_dtype=compute_dtype)
+        if layout != "interleaved":
+            raise ValueError("SeedVR RoPE only supports interleaved layout.")
+        self.implementation = None
+
+    def set_config(self, config=None):
+        super().set_config(config)
+        if config is not None:
+            self.implementation = self.implementation_class(dim=config["rope_dim"])
+
+    def apply(self, q, k, shape, *, cache, txt_q=None, txt_k=None, txt_shape=None, **kwargs):
+        if self.implementation is None:
+            raise RuntimeError("SeedVR RoPE must be configured before apply().")
+        if self.multimodal:
+            return self.implementation(q, k, shape, txt_q, txt_k, txt_shape, cache)
+        return self.implementation(q, k, shape, cache)
+
+
+@ROPE_REGISTER("rope3d")
+class SeedVRRope3D(SeedVRRopeBase):
+    implementation_class = NaRotaryEmbedding3d
+
+
+@ROPE_REGISTER("mmrope3d")
+class SeedVRMMRope3D(SeedVRRopeBase):
+    multimodal = True
+    implementation_class = NaMMRotaryEmbedding3d

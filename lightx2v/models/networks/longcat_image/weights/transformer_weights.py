@@ -1,5 +1,7 @@
+import torch
+
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
-from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER
+from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, LN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER, ROPE_REGISTER
 
 
 class LongCatImageDoubleBlockWeights(WeightModule):
@@ -11,10 +13,20 @@ class LongCatImageDoubleBlockWeights(WeightModule):
         self.block_idx = block_idx
         self.inner_dim = config["num_attention_heads"] * config["attention_head_dim"]
         self.mm_type = config.get("dit_quant_scheme", "Default")
+        self.layer_norm_type = config.get("layer_norm_type", "torch")
         self.rms_norm_type = config.get("rms_norm_type", "torch")
         self.attn_type = config.get("attn_type", "flash_attn3")
+        self.add_module(
+            "rope",
+            ROPE_REGISTER[config.get("rope_type", "flashinfer_rope")](layout="interleaved", compute_dtype=torch.float32),
+        )
 
         p = f"transformer_blocks.{self.block_idx}"
+
+        self.add_module("norm1", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
+        self.add_module("norm1_context", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
+        self.add_module("norm2", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
+        self.add_module("norm2_context", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
 
         # Image stream norm1 (AdaLayerNormZero)
         self.add_module(
@@ -150,6 +162,11 @@ class LongCatImageDoubleBlockWeights(WeightModule):
 
         # Attention calculation module
         self.add_module("calculate", ATTN_WEIGHT_REGISTER[self.attn_type]())
+        if self.config["seq_parallel"]:
+            self.add_module(
+                "calculate_parallel",
+                ATTN_WEIGHT_REGISTER[self.config["parallel"].get("seq_p_attn_type", "ulysses")](),
+            )
 
         # Image FFN
         self.add_module(
@@ -211,10 +228,17 @@ class LongCatImageSingleBlockWeights(WeightModule):
         self.block_idx = block_idx
         self.inner_dim = config["num_attention_heads"] * config["attention_head_dim"]
         self.mm_type = config.get("dit_quant_scheme", "Default")
+        self.layer_norm_type = config.get("layer_norm_type", "torch")
         self.rms_norm_type = config.get("rms_norm_type", "torch")
         self.attn_type = config.get("attn_type", "flash_attn3")
+        self.add_module(
+            "rope",
+            ROPE_REGISTER[config.get("rope_type", "flashinfer_rope")](layout="interleaved", compute_dtype=torch.float32),
+        )
 
         p = f"single_transformer_blocks.{self.block_idx}"
+
+        self.add_module("norm", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
 
         # AdaLayerNormZeroSingle
         self.add_module(
@@ -296,6 +320,11 @@ class LongCatImageSingleBlockWeights(WeightModule):
 
         # Attention calculation module
         self.add_module("calculate", ATTN_WEIGHT_REGISTER[self.attn_type]())
+        if self.config["seq_parallel"]:
+            self.add_module(
+                "calculate_parallel",
+                ATTN_WEIGHT_REGISTER[self.config["parallel"].get("seq_p_attn_type", "ulysses")](),
+            )
 
     def to_cuda(self, non_blocking=True):
         for module in self._modules.values():

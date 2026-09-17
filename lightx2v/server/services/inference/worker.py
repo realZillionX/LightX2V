@@ -7,9 +7,8 @@ from typing import Any, Dict
 import torch
 from loguru import logger
 
-from lightx2v.infer import init_runner
-from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
-from lightx2v.utils.set_config import set_config, set_parallel_config
+from lightx2v.models.runners.runner_factory import build_runner
+from lightx2v.utils.set_config import build_startup_config, init_parallel
 
 from ..distributed_utils import DistributedManager
 from .pipeline_image_encode import encode_pipeline_return_to_png_bytes
@@ -46,18 +45,24 @@ class TorchrunInferenceWorker:
                 else:
                     logger.info(f"LoRA directory set to: {self.lora_dir}")
 
-            config = set_config(args)
+            config = build_startup_config(
+                {
+                    "config_json": args.config_json,
+                    "model_cls": args.model_cls,
+                    "model_variant": args.model_variant,
+                    "model_path": args.model_path,
+                    "task": args.task,
+                }
+            )
 
             if config["parallel"]:
-                set_parallel_config(config)
+                init_parallel(config)
 
             if self.rank == 0:
                 logger.info(f"Config:\n {config}")
 
-            self.runner = init_runner(config)
-            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed")
-
-            self.input_info = init_empty_input_info(args.task)
+            self.runner = build_runner(config)
+            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed; supported tasks: {', '.join(self.runner.supported_tasks)}")
 
             return True
 
@@ -68,41 +73,37 @@ class TorchrunInferenceWorker:
     async def process_request(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         has_error = False
         error_msg = ""
+        error_type = ""
         pipeline_return = None
+        return_pipeline_result = False
+        task_id = task_data.get("task_id", "unknown")
 
         try:
             if self.world_size > 1 and self.rank == 0:
                 task_data = self.dist_manager.broadcast_task_data(task_data)
 
+            task_id = task_data.pop("task_id", "unknown")
+            return_pipeline_result = bool(task_data.pop("_return_pipeline_result", False))
+
             # Handle dynamic LoRA loading
             lora_name = task_data.pop("lora_name", None)
             lora_strength = task_data.pop("lora_strength", 1.0)
+            reuse = task_data.pop("reuse", False)
+            reuse_prefix_segments = task_data.pop("reuse_prefix_segments", 0)
 
+            input_info = self.runner.prepare_request(task_data)
             if self.lora_dir:
                 self.switch_lora(lora_name, lora_strength)
 
-            task_data["task"] = self.runner.config["task"]
-            task_data["return_result_tensor"] = bool(task_data.get("return_result_tensor", False))
-            task_data["negative_prompt"] = task_data.get("negative_prompt", "")
-
-            target_fps = task_data.pop("target_fps", None)
-            if target_fps is not None:
-                vfi_cfg = self.runner.config.get("video_frame_interpolation")
-                if vfi_cfg:
-                    task_data["video_frame_interpolation"] = {**vfi_cfg, "target_fps": target_fps}
-                else:
-                    logger.warning(f"Target FPS {target_fps} is set, but video frame interpolation is not configured")
-
-            update_input_info_from_dict(self.input_info, task_data)
-
-            self.runner.set_config(task_data)
-            pipeline_return = self.runner.run_pipeline(self.input_info)
+            self.runner.set_reuse(reuse, reuse_prefix_segments)
+            pipeline_return = self.runner.run_request(input_info)
 
             await asyncio.sleep(0)
 
         except Exception as e:
             has_error = True
             error_msg = str(e)
+            error_type = type(e).__name__
             logger.exception(f"Rank {self.rank} inference failed: {error_msg}")
 
         if self.world_size > 1:
@@ -111,14 +112,15 @@ class TorchrunInferenceWorker:
         if self.rank == 0:
             if has_error:
                 return {
-                    "task_id": task_data.get("task_id", "unknown"),
+                    "task_id": task_id,
                     "status": "failed",
                     "error": error_msg,
+                    "error_type": error_type,
                     "message": f"Inference failed: {error_msg}",
                 }
             else:
                 out: Dict[str, Any] = {
-                    "task_id": task_data["task_id"],
+                    "task_id": task_id,
                     "status": "success",
                     "save_result_path": task_data.get("save_result_path"),
                     "message": "Inference completed",
@@ -127,9 +129,18 @@ class TorchrunInferenceWorker:
                     encode_start = time.perf_counter()
                     png = encode_pipeline_return_to_png_bytes(pipeline_return)
                     encode_elapsed_ms = (time.perf_counter() - encode_start) * 1000
-                    logger.info(f"Task {task_data.get('task_id')} encode result_png cost {encode_elapsed_ms:.2f} ms")
+                    logger.info(f"Task {task_id} encode result_png cost {encode_elapsed_ms:.2f} ms")
                     if png:
                         out["result_png"] = png
+                    usage = self.runner.compute_usage(
+                        prompt=task_data.get("prompt", ""),
+                        size=task_data.get("size", []),
+                        has_input_image=bool(task_data.get("image_path")),
+                    )
+                    if usage:
+                        out["usage"] = usage
+                if return_pipeline_result:
+                    out["pipeline_return"] = pipeline_return
                 return out
         else:
             return None

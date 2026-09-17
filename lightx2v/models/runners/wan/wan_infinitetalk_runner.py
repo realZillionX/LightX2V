@@ -1,0 +1,1297 @@
+import gc
+import json
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+
+import imageio_ffmpeg as ffmpeg
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image
+from loguru import logger
+
+from lightx2v.models.input_encoders.hf.infinitetalk.audio_encoder import InfiniteTalkAudioEncoder
+from lightx2v.models.networks.wan.infinitetalk_model import WanInfiniteTalkModel
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
+from lightx2v.models.runners.wan.wan_runner import WanRunner
+from lightx2v.models.schedulers.wan.infinitetalk.scheduler import InfiniteTalkScheduler
+from lightx2v.server.metrics import monitor_cli
+from lightx2v.utils.audio_io import load_audio_file
+from lightx2v.utils.envs import GET_DTYPE, GET_RECORDER_MODE
+from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
+from lightx2v.utils.registry_factory import RUNNER_REGISTER
+from lightx2v.utils.utils import is_main_process, save_to_video, wan_vae_to_comfy
+from lightx2v.utils.va_controller import VAController
+from lightx2v_platform.base.global_var import AI_DEVICE
+
+torch_device_module = getattr(torch, AI_DEVICE)
+
+try:
+    import librosa
+except ImportError:
+    librosa = None
+
+try:
+    import pyloudnorm as pyln
+except ImportError:
+    pyln = None
+
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+
+try:
+    from decord import VideoReader, cpu
+except ImportError:
+    VideoReader = None
+    cpu = None
+
+
+VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".mpeg", ".mpg")
+
+ASPECT_RATIO_627 = {
+    "0.26": ([320, 1216], 1),
+    "0.38": ([384, 1024], 1),
+    "0.50": ([448, 896], 1),
+    "0.67": ([512, 768], 1),
+    "0.82": ([576, 704], 1),
+    "1.00": ([640, 640], 1),
+    "1.22": ([704, 576], 1),
+    "1.50": ([768, 512], 1),
+    "1.86": ([832, 448], 1),
+    "2.00": ([896, 448], 1),
+    "2.50": ([960, 384], 1),
+    "2.83": ([1088, 384], 1),
+    "3.60": ([1152, 320], 1),
+    "3.80": ([1216, 320], 1),
+    "4.00": ([1280, 320], 1),
+}
+
+ASPECT_RATIO_960 = {
+    "0.22": ([448, 2048], 1),
+    "0.29": ([512, 1792], 1),
+    "0.36": ([576, 1600], 1),
+    "0.45": ([640, 1408], 1),
+    "0.55": ([704, 1280], 1),
+    "0.63": ([768, 1216], 1),
+    "0.76": ([832, 1088], 1),
+    "0.88": ([896, 1024], 1),
+    "1.00": ([960, 960], 1),
+    "1.14": ([1024, 896], 1),
+    "1.31": ([1088, 832], 1),
+    "1.50": ([1152, 768], 1),
+    "1.58": ([1216, 768], 1),
+    "1.82": ([1280, 704], 1),
+    "1.91": ([1344, 704], 1),
+    "2.20": ([1408, 640], 1),
+    "2.30": ([1472, 640], 1),
+    "2.67": ([1536, 576], 1),
+    "2.89": ([1664, 576], 1),
+    "3.62": ([1856, 512], 1),
+    "3.75": ([1920, 512], 1),
+}
+
+
+def _is_video(path):
+    return os.path.splitext(path)[1].lower() in VID_EXTENSIONS
+
+
+@RUNNER_REGISTER("infinitetalk")
+class InfiniteTalkRunner(WanRunner):
+    supported_request_fields_by_task = {
+        "s2v": COMMON_REQUEST_FIELDS
+        | PROMPT_FIELDS
+        | {
+            "audio_path",
+            "image_path",
+            "num_frames",
+            "video_duration",
+            "video_path",
+        },
+    }
+
+    def __init__(self, config):
+        super().__init__(config)
+        assert self.config["task"] == "s2v", "InfiniteTalk runner expects task=s2v"
+        self.audio_sample_rate = int(self.config.get("audio_sample_rate", 16000))
+        self.target_fps = int(self.config.get("fps", 25))
+        self.video_audio_path = None
+        self.video_audio_array = None
+        self.cond_video_temp_path = None
+        self.cond_video_duration = None
+        self.va_controller = None
+        self.stream_save_video = False
+        self.cond_video_reader = None
+        self.cond_video_reader_path = None
+        self.cond_static_image = None
+        self.cond_static_image_path = None
+        self.cond_frame_cache = {}
+        self.cond_video_fps = None
+        self.cond_video_frame_count = None
+        self.stream_saved_video_needs_audio_remux = False
+
+    def init_scheduler(self):
+        self.scheduler = InfiniteTalkScheduler(self.config)
+
+    def check_segment_reuse_support(self):
+        pass
+
+    def init_modules(self):
+        logger.info("Initializing InfiniteTalk runner modules...")
+        self.load_model()
+        self.model.set_scheduler(self.scheduler)
+        self.run_input_encoder = self._run_input_encoder_local_s2v
+        self.config.lock()
+
+    @ProfilingContext4DebugL2("Load models")
+    def load_model(self):
+        self.model = self.load_transformer()
+        self.text_encoders = self.load_text_encoder()
+        self.image_encoder = self.load_image_encoder()
+        self.vae_encoder, self.vae_decoder = self.load_vae()
+        self.audio_encoder = self.load_audio_encoder()
+        self.vsr_model = None
+
+    def load_transformer(self):
+        return WanInfiniteTalkModel(self.config["model_path"], self.config, self.init_device)
+
+    def load_audio_encoder(self):
+        audio_encoder_path = self.config.get("audio_encoder_path", None)
+        if audio_encoder_path is None:
+            raise ValueError("InfiniteTalk requires audio_encoder_path in config.")
+        device = self.config.get("wav2vec_device", "cpu")
+        return InfiniteTalkAudioEncoder(audio_encoder_path, device=device, fps=self.target_fps, sample_rate=self.audio_sample_rate)
+
+    @ProfilingContext4DebugL1(
+        "Run Text Encoder",
+        recorder_mode=GET_RECORDER_MODE(),
+        metrics_func=monitor_cli.lightx2v_run_text_encode_duration,
+        metrics_labels=["InfiniteTalkRunner"],
+    )
+    def run_text_encoder(self, input_info):
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            self.text_encoders = self.load_text_encoder()
+
+        prompt = input_info.prompt
+        if GET_RECORDER_MODE():
+            monitor_cli.lightx2v_input_prompt_len.observe(len(prompt))
+
+        context = self.text_encoders[0].infer([prompt])
+        context = torch.stack([torch.cat([u, u.new_zeros(self.config["text_len"] - u.size(0), u.size(1))]) for u in context])
+        if self.config.get("enable_cfg", False) and self.config.get("enable_text_cfg", True):
+            context_null = self.text_encoders[0].infer([input_info.negative_prompt])
+            context_null = torch.stack([torch.cat([u, u.new_zeros(self.config["text_len"] - u.size(0), u.size(1))]) for u in context_null])
+        else:
+            context_null = None
+
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            del self.text_encoders[0]
+            torch_device_module.empty_cache()
+            gc.collect()
+
+        return {
+            "context": context,
+            "context_null": context_null,
+        }
+
+    def _load_input_data(self):
+        cfg_input = self.config.get("infinitetalk_input", None)
+        if cfg_input is not None:
+            data = dict(cfg_input)
+            data["cond_audio"] = dict(data["cond_audio"])
+        else:
+            cond_audio = self.config.get("cond_audio", None)
+            mask_files = {}
+            bbox = None
+            if cond_audio is not None:
+                cond_audio = dict(cond_audio)
+            else:
+                audio_path = getattr(self.input_info, "audio_path", "") or self.config.get("audio_path", "")
+                if audio_path and os.path.isdir(audio_path):
+                    cond_audio, mask_files, bbox = self._load_directory_audio_input(audio_path)
+                else:
+                    audio_paths = [item.strip() for item in str(audio_path).split(",") if item.strip()]
+                    cond_audio = {f"person{idx + 1}": path for idx, path in enumerate(audio_paths)}
+
+            cond_video = self.input_info.video_path or self.input_info.image_path or self.config.get("cond_video", "") or self.config.get("image_path", "")
+            data = {
+                "prompt": getattr(self.input_info, "prompt", "") or self.config.get("prompt", ""),
+                "cond_video": cond_video,
+                "cond_audio": cond_audio,
+            }
+            if mask_files:
+                data["mask_files"] = mask_files
+            if bbox:
+                data["bbox"] = bbox
+            if self.config.get("audio_type", None):
+                data["audio_type"] = self.config["audio_type"]
+            if self.config.get("bbox", None):
+                data["bbox"] = self.config["bbox"]
+
+        input_cond_video = self.input_info.video_path or self.input_info.image_path
+        if input_cond_video:
+            data["cond_video"] = input_cond_video
+
+        if not data.get("prompt"):
+            raise ValueError("InfiniteTalk requires prompt from --prompt or config infinitetalk_input/prompt.")
+        if not data.get("cond_video"):
+            raise ValueError("InfiniteTalk requires cond_video from --video_path, --image_path, or config.")
+        if not data.get("cond_audio"):
+            raise ValueError("InfiniteTalk requires cond_audio from --audio_path or config.")
+
+        return data
+
+    @staticmethod
+    def _person_sort_key(person_name):
+        suffix = str(person_name or "").replace("person", "")
+        return int(suffix) if suffix.isdigit() else 9999
+
+    @classmethod
+    def _sorted_person_items(cls, person_map):
+        return sorted(person_map.items(), key=lambda item: cls._person_sort_key(item[0]))
+
+    def _load_directory_audio_input(self, audio_dir):
+        config_path = os.path.join(audio_dir, "config.json")
+        if not os.path.exists(config_path):
+            raise ValueError(f"InfiniteTalk audio directory requires config.json: {audio_dir}")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        talk_objects = config.get("talk_objects") or []
+        if not isinstance(talk_objects, list) or not talk_objects:
+            raise ValueError(f"InfiniteTalk audio directory config.json must contain non-empty talk_objects: {config_path}")
+
+        cond_audio = {}
+        mask_files = {}
+        bbox = {}
+        for idx, item in enumerate(talk_objects):
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid talk object at index {idx}: {item!r}")
+
+            person_name = item.get("person") or item.get("name") or f"person{idx + 1}"
+            audio_name = item.get("audio")
+            if not audio_name:
+                raise ValueError(f"Missing audio in talk object {person_name}: {item!r}")
+            cond_audio[person_name] = os.path.join(audio_dir, audio_name)
+
+            mask_name = item.get("mask")
+            if mask_name:
+                mask_files[person_name] = os.path.join(audio_dir, mask_name)
+
+            person_bbox = item.get("bbox")
+            if person_bbox:
+                bbox[person_name] = person_bbox
+
+        if self.config.get("infinitetalk_mode") == "multi" and len(cond_audio) == 1 and (mask_files or bbox):
+            existing_person = next(iter(cond_audio))
+            dummy_person = "person2" if existing_person == "person1" and "person2" not in cond_audio else f"{existing_person}_dummy"
+            cond_audio[dummy_person] = "None"
+            bbox[dummy_person] = [0, 0, 2, 2]
+            logger.info("InfiniteTalk multi mode added dummy silent person for single masked talk_object input.")
+
+        return cond_audio, mask_files, bbox
+
+    @staticmethod
+    def _loudness_norm(audio_array, sr=16000, lufs=-23):
+        if pyln is None:
+            return audio_array
+        meter = pyln.Meter(sr)
+        loudness = meter.integrated_loudness(audio_array)
+        if abs(loudness) > 100:
+            return audio_array
+        return pyln.normalize.loudness(audio_array, loudness, lufs)
+
+    def _extract_audio_from_video(self, filename):
+        audio_dir = self.config.get("audio_save_dir", os.path.join(os.getcwd(), "save_results", "infinitetalk_audio"))
+        os.makedirs(audio_dir, exist_ok=True)
+        raw_audio_path = os.path.join(audio_dir, os.path.splitext(os.path.basename(filename))[0] + "_raw.wav")
+        cmd = [
+            ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-i",
+            str(filename),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(self.audio_sample_rate),
+            "-ac",
+            "2",
+            raw_audio_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audio = self._load_audio_array(raw_audio_path)
+        try:
+            os.remove(raw_audio_path)
+        except OSError:
+            pass
+        return audio
+
+    def _load_audio_array(self, audio_path):
+        if _is_video(audio_path):
+            return self._extract_audio_from_video(audio_path)
+        if librosa is not None:
+            audio_array, sr = librosa.load(audio_path, sr=self.audio_sample_rate)
+            return self._loudness_norm(audio_array, sr)
+
+        audio_tensor, sr = load_audio_file(audio_path)
+        audio_tensor = audio_tensor.float().mean(0)
+        if sr != self.audio_sample_rate:
+            target_len = int(round(audio_tensor.numel() * self.audio_sample_rate / sr))
+            audio_tensor = F.interpolate(audio_tensor.view(1, 1, -1), size=target_len, mode="linear", align_corners=True).view(-1)
+        return self._loudness_norm(audio_tensor.cpu().numpy(), self.audio_sample_rate)
+
+    def _audio_prepare_single(self, audio_path):
+        return self._load_audio_array(audio_path)
+
+    def _audio_prepare_multi(self, left_path, right_path, audio_type):
+        if not (left_path == "None" or right_path == "None"):
+            speech1 = self._audio_prepare_single(left_path)
+            speech2 = self._audio_prepare_single(right_path)
+        elif left_path == "None":
+            speech2 = self._audio_prepare_single(right_path)
+            speech1 = np.zeros(speech2.shape[0], dtype=speech2.dtype)
+        else:
+            speech1 = self._audio_prepare_single(left_path)
+            speech2 = np.zeros(speech1.shape[0], dtype=speech1.dtype)
+
+        if audio_type == "para":
+            new_speech1 = speech1
+            new_speech2 = speech2
+        elif audio_type == "add":
+            new_speech1 = np.concatenate([speech1[: speech1.shape[0]], np.zeros(speech2.shape[0], dtype=speech1.dtype)])
+            new_speech2 = np.concatenate([np.zeros(speech1.shape[0], dtype=speech2.dtype), speech2[: speech2.shape[0]]])
+        else:
+            raise ValueError(f"Unsupported InfiniteTalk audio_type: {audio_type}")
+        return new_speech1, new_speech2, new_speech1 + new_speech2
+
+    @staticmethod
+    def _pad_audio_array(audio_array, target_len):
+        if audio_array.shape[0] >= target_len:
+            return audio_array[:target_len]
+        padding = np.zeros(target_len - audio_array.shape[0], dtype=audio_array.dtype)
+        return np.concatenate([audio_array, padding])
+
+    def _audio_prepare_many(self, audio_paths, audio_type):
+        speeches = [None if audio_path == "None" else self._audio_prepare_single(audio_path) for audio_path in audio_paths]
+        available_speeches = [speech for speech in speeches if speech is not None]
+
+        if not available_speeches:
+            raise ValueError("InfiniteTalk requires at least one non-empty person audio.")
+
+        first_speech = available_speeches[0]
+        if audio_type == "para":
+            target_len = max(speech.shape[0] for speech in available_speeches)
+            prepared = [self._pad_audio_array(speech, target_len) if speech is not None else np.zeros(target_len, dtype=first_speech.dtype) for speech in speeches]
+        elif audio_type == "add":
+            lengths = [speech.shape[0] if speech is not None else 0 for speech in speeches]
+            target_len = sum(lengths)
+            prepared = []
+            offset = 0
+            for speech, length in zip(speeches, lengths):
+                track = np.zeros(target_len, dtype=first_speech.dtype)
+                if speech is not None and length > 0:
+                    track[offset : offset + length] = speech[:length]
+                prepared.append(track)
+                offset += length
+        else:
+            raise ValueError(f"Unsupported InfiniteTalk audio_type: {audio_type}")
+
+        return prepared, np.sum(np.stack(prepared, axis=0), axis=0)
+
+    def _write_sum_audio(self, input_data, audio_arrays):
+        self.video_audio_array = np.asarray(audio_arrays, dtype=np.float32)
+        if sf is not None:
+            fd, audio_path = tempfile.mkstemp(prefix="infinitetalk_sum_", suffix=".wav")
+            os.close(fd)
+            sf.write(audio_path, audio_arrays, self.audio_sample_rate)
+            self.video_audio_path = audio_path
+        else:
+            logger.warning("soundfile is unavailable; generated video will be saved without muxed audio.")
+            self.video_audio_path = None
+
+    def _remove_video_audio_path(self):
+        audio_path = self.video_audio_path
+        self.video_audio_path = None
+        if audio_path and os.path.isfile(audio_path):
+            basename = os.path.basename(audio_path)
+            if not (basename.startswith("infinitetalk_sum_") and basename.endswith(".wav")):
+                logger.warning(f"Skip removing unexpected InfiniteTalk temp audio path: {audio_path}")
+                return
+            try:
+                os.remove(audio_path)
+            except OSError as exc:
+                logger.warning(f"Failed to remove temporary audio file {audio_path}: {exc}")
+
+    def _remove_cond_video_temp_path(self):
+        cond_video_temp_path = self.cond_video_temp_path
+        self.cond_video_temp_path = None
+        if cond_video_temp_path and os.path.isfile(cond_video_temp_path):
+            try:
+                os.remove(cond_video_temp_path)
+            except OSError as exc:
+                logger.warning(f"Failed to remove temporary cond_video file {cond_video_temp_path}: {exc}")
+
+    def _load_or_encode_audio(self, audio_path_or_array):
+        if isinstance(audio_path_or_array, np.ndarray):
+            return self.audio_encoder.infer(audio_path_or_array)
+        if str(audio_path_or_array).endswith((".pt", ".pth")):
+            return torch.load(audio_path_or_array, map_location="cpu")
+        return self.audio_encoder.infer(self._audio_prepare_single(audio_path_or_array))
+
+    @staticmethod
+    def _get_video_codec(video_path):
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    video_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return result.stdout.strip()
+        except Exception as exc:
+            logger.warning(f"Failed to probe video codec for {video_path}: {exc}")
+            return ""
+
+    def _prepare_cond_video_path(self, cond_video):
+        if not _is_video(cond_video):
+            return cond_video
+
+        codec = self._get_video_codec(cond_video)
+        if codec != "av1":
+            return cond_video
+
+        fd, output_video_path = tempfile.mkstemp(prefix="infinitetalk_input_h264_", suffix=".mp4")
+        os.close(fd)
+        cmd = [
+            ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-i",
+            cond_video,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "copy",
+            output_video_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            if os.path.exists(output_video_path):
+                os.remove(output_video_path)
+            raise
+        self.cond_video_temp_path = output_video_path
+        logger.info(f"Converted AV1 cond_video to H.264: {output_video_path}")
+        return output_video_path
+
+    def _prepare_audio_embeddings(self, input_data):
+        cond_audio = input_data["cond_audio"]
+        audio_items = self._sorted_person_items(cond_audio)
+        if len(audio_items) > 1:
+            audio_type = input_data.get("audio_type", "para")
+            audio_paths = [path for _, path in audio_items]
+            speeches, sum_speech = self._audio_prepare_many(audio_paths, audio_type)
+            self._write_sum_audio(input_data, sum_speech)
+            return [self._load_or_encode_audio(speech) for speech in speeches]
+
+        speech = self._audio_prepare_single(audio_items[0][1])
+        self._write_sum_audio(input_data, speech)
+        return [self._load_or_encode_audio(speech)]
+
+    def reuse_key(self):
+        return {
+            "prompt": self.input_info.prompt,
+            "negative_prompt": self.input_info.negative_prompt,
+            "cond_audio": self.input_data["cond_audio"],
+            "audio_type": self.input_data.get("audio_type", "para"),
+            "cond_video": self.input_data["cond_video"],
+            "mask_files": self.input_data.get("mask_files") or {},
+            "bbox": self.input_data.get("bbox") or {},
+            "num_frames": self.resolve_frame_num(),
+            "video_duration": self._resolve_video_duration(),
+            "infer_steps": self.config["infer_steps"],
+            "size": list(self.input_info.size),
+            "target_fps": self.target_fps,
+            "motion_frame": self.config.get("motion_frame", 9),
+        }
+
+    def load_reused_inputs(self):
+        cached = self.load_reuse_state(map_location="cpu")
+        inputs = cached["inputs"]
+        inputs["text_encoder_output"] = {name: value.to(AI_DEVICE) if value is not None else None for name, value in inputs["text_encoder_output"].items()}
+        self._write_sum_audio(self.input_data, cached["video_audio_array"].numpy())
+        logger.info("[Reuse] Loaded InfiniteTalk input encoder output from disk")
+        return inputs
+
+    def save_reuse_inputs(self):
+        inputs = {
+            "text_encoder_output": {name: value.detach().cpu() if value is not None else None for name, value in self.inputs["text_encoder_output"].items()},
+            "full_audio_embs": [value.detach().cpu() for value in self.inputs["full_audio_embs"]],
+            "human_num": self.inputs["human_num"],
+        }
+        torch.save(
+            {
+                "inputs": inputs,
+                "video_audio_array": torch.as_tensor(self.video_audio_array),
+            },
+            self.reuse_inputs_path(self.reuse_cache_stage_dir),
+        )
+
+    def prepare_reuse_output(self):
+        super().prepare_reuse_output()
+        if self.final_result_path is None:
+            return
+
+        output_stem, output_ext = os.path.splitext(self.final_result_path)
+        self.work_result_path = f"{output_stem}.infinitetalk-work{output_ext or '.mp4'}"
+        self.input_info.save_result_path = self.work_result_path
+
+    def stage_reuse_cache(self):
+        super().stage_reuse_cache()
+        if self.reuse_cache_dir is None or not self.reuse or not is_main_process():
+            return
+
+        for boundary_idx in range(self.reuse_prefix_segments):
+            name = f"boundary_{boundary_idx:05d}.pt"
+            shutil.copy2(os.path.join(self.reuse_cache_dir, name), os.path.join(self.reuse_cache_stage_dir, name))
+
+    def load_cached_motion_latent(self, boundary_idx):
+        path = os.path.join(self.reuse_cache_dir, f"boundary_{boundary_idx:05d}.pt")
+        logger.info(f"[Reuse] Loading InfiniteTalk boundary latent: {path}")
+        return torch.load(path, map_location=AI_DEVICE, weights_only=True)
+
+    def save_motion_latent(self, boundary_idx, latent_motion_frames):
+        if self.reuse_cache_stage_dir is None or not is_main_process():
+            return
+        path = os.path.join(self.reuse_cache_stage_dir, f"boundary_{boundary_idx:05d}.pt")
+        torch.save(latent_motion_frames.detach().cpu(), path)
+
+    def merge_reused_video(self):
+        output_stem, output_ext = os.path.splitext(self.final_result_path)
+        merged_video_path = f"{output_stem}.infinitetalk-merged{output_ext or '.mp4'}"
+        prefix_frames = self.reuse_prefix_frame_count()
+        filter_graph = ";".join(
+            [
+                f"[0:v]trim=end_frame={prefix_frames},setpts=PTS-STARTPTS[prefix]",
+                "[1:v]setpts=PTS-STARTPTS[suffix]",
+                "[prefix][suffix]concat=n=2:v=1:a=0[video]",
+            ]
+        )
+        try:
+            subprocess.run(
+                [
+                    ffmpeg.get_ffmpeg_exe(),
+                    "-y",
+                    "-i",
+                    self.previous_result_path,
+                    "-i",
+                    self.work_result_path,
+                    "-filter_complex",
+                    filter_graph,
+                    "-map",
+                    "[video]",
+                    "-map",
+                    "0:a?",
+                    "-c:v",
+                    "libx264",
+                    "-r",
+                    str(self.target_fps),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "copy",
+                    merged_video_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.replace(merged_video_path, self.work_result_path)
+        finally:
+            if os.path.exists(merged_video_path):
+                os.remove(merged_video_path)
+
+    def commit_reuse_result(self):
+        if self.reuse_cache_dir is not None and self.reuse_prefix_segments and is_main_process():
+            self.merge_reused_video()
+        super().commit_reuse_result()
+
+    def _close_cond_video_reader(self):
+        if self.cond_video_reader is not None:
+            del self.cond_video_reader
+            self.cond_video_reader = None
+        self.cond_video_reader_path = None
+
+    def _clear_cond_frame_source(self):
+        self._close_cond_video_reader()
+        self.cond_static_image = None
+        self.cond_static_image_path = None
+        self.cond_frame_cache.clear()
+        gc.collect()
+
+    def _get_cond_video_reader(self, video_path):
+        if VideoReader is None:
+            raise ImportError("decord is required for InfiniteTalk video cond_video inputs.")
+        if self.cond_video_reader is None or self.cond_video_reader_path != video_path:
+            self._close_cond_video_reader()
+            self.cond_video_reader = VideoReader(video_path, ctx=cpu(0))
+            self.cond_video_reader_path = video_path
+        return self.cond_video_reader
+
+    def _cache_cond_frame(self, frame_id, image):
+        cache_size = int(self.config.get("cond_frame_cache_size", 2))
+        if cache_size <= 0:
+            return image
+        self.cond_frame_cache[frame_id] = image
+        while len(self.cond_frame_cache) > cache_size:
+            self.cond_frame_cache.pop(next(iter(self.cond_frame_cache)))
+        return image
+
+    def _extract_specific_frame(self, video_path, frame_id):
+        if not _is_video(video_path):
+            if self.cond_static_image is None or self.cond_static_image_path != video_path:
+                self.cond_static_image = Image.open(video_path).convert("RGB")
+                self.cond_static_image_path = video_path
+            return self.cond_static_image
+
+        frame_id = max(int(frame_id), 0)
+        cached_frame = self.cond_frame_cache.get(frame_id)
+        if cached_frame is not None:
+            return cached_frame
+
+        vr = self._get_cond_video_reader(video_path)
+        if frame_id < len(vr):
+            frame = vr[frame_id].asnumpy()
+        else:
+            frame = vr[-1].asnumpy()
+        return self._cache_cond_frame(frame_id, Image.fromarray(frame))
+
+    def _get_cond_video_duration(self, video_path):
+        self.cond_video_fps = None
+        self.cond_video_frame_count = None
+        if not _is_video(video_path):
+            return None
+        vr = self._get_cond_video_reader(video_path)
+        frame_count = len(vr)
+        fps = float(vr.get_avg_fps() or self.target_fps)
+        if frame_count <= 0 or fps <= 0:
+            return None
+        self.cond_video_fps = fps
+        self.cond_video_frame_count = frame_count
+        return frame_count / fps
+
+    def _map_target_frame_to_cond_frame(self, frame_id):
+        if self.cond_video_fps is None or self.cond_video_fps <= 0 or self.target_fps <= 0:
+            source_frame_id = int(frame_id)
+        else:
+            target_time = float(frame_id) / float(self.target_fps)
+            source_frame_id = int(round(target_time * float(self.cond_video_fps)))
+
+        if self.cond_video_frame_count is not None and self.cond_video_frame_count > 0:
+            source_frame_id = min(source_frame_id, int(self.cond_video_frame_count) - 1)
+        return max(0, source_frame_id)
+
+    @staticmethod
+    def _resize_and_centercrop(cond_image, target_size):
+        if isinstance(cond_image, torch.Tensor):
+            _, orig_h, orig_w = cond_image.shape
+        else:
+            orig_h, orig_w = cond_image.height, cond_image.width
+
+        target_h, target_w = target_size
+        scale = max(target_h / orig_h, target_w / orig_w)
+        final_h = math.ceil(scale * orig_h)
+        final_w = math.ceil(scale * orig_w)
+
+        if isinstance(cond_image, torch.Tensor):
+            resized = F.interpolate(cond_image.unsqueeze(0), size=(final_h, final_w), mode="nearest").contiguous()
+            return TF.center_crop(resized, target_size).squeeze(0)
+
+        resized = cond_image.resize((final_w, final_h), resample=Image.BILINEAR)
+        resized_tensor = torch.from_numpy(np.array(resized))[None].permute(0, 3, 1, 2).contiguous()
+        cropped = TF.center_crop(resized_tensor, target_size)
+        return cropped[:, :, None, :, :]
+
+    def _select_target_size(self, image):
+        bucket_config = ASPECT_RATIO_960 if self.config.get("infinitetalk_size", "infinitetalk-720") == "infinitetalk-720" else ASPECT_RATIO_627
+        src_h, src_w = image.height, image.width
+        ratio = src_h / src_w
+        closest_bucket = sorted(list(bucket_config.keys()), key=lambda x: abs(float(x) - ratio))[0]
+        target_h, target_w = bucket_config[closest_bucket][0]
+        return src_h, src_w, target_h, target_w
+
+    def _prepare_cond_image(self, frame_id):
+        source_frame_id = self._map_target_frame_to_cond_frame(frame_id) if _is_video(self.cond_file_path) else frame_id
+        image = self._extract_specific_frame(self.cond_file_path, source_frame_id)
+        image = self._resize_and_centercrop(image, (self.target_h, self.target_w))
+        image = image.float() / 255.0
+        image = (image - 0.5) * 2
+        return image.to(AI_DEVICE)
+
+    def _build_ref_target_masks(self, human_num, latent_h, latent_w):
+        human_masks = []
+        mask_files = self.input_data.get("mask_files") or {}
+        bbox = self.input_data.get("bbox") or {}
+        if mask_files or bbox:
+            person_items = self._sorted_person_items(self.input_data.get("cond_audio", {}))[:human_num]
+            if len(person_items) < human_num:
+                raise ValueError("InfiniteTalk multi-person input requires one mask file or bbox for each person audio.")
+            background_mask = torch.zeros([self.src_h, self.src_w])
+
+            for person_name, _ in person_items:
+                if person_name in mask_files:
+                    mask_image = Image.open(mask_files[person_name]).convert("L")
+                    if mask_image.size != (self.src_w, self.src_h):
+                        mask_image = mask_image.resize((self.src_w, self.src_h), resample=Image.NEAREST)
+                    mask_array = np.array(mask_image)
+                    human_mask = torch.from_numpy((mask_array > 127).astype(np.float32))
+                elif person_name in bbox:
+                    x_min, y_min, x_max, y_max = bbox[person_name]
+                    x_min = max(0, min(self.src_w - 1, int(x_min)))
+                    y_min = max(0, min(self.src_h - 1, int(y_min)))
+                    x_max = max(x_min + 1, min(self.src_w, int(math.ceil(x_max))))
+                    y_max = max(y_min + 1, min(self.src_h, int(math.ceil(y_max))))
+                    human_mask = torch.zeros([self.src_h, self.src_w])
+                    human_mask[y_min:y_max, x_min:x_max] = 1
+                else:
+                    raise ValueError("InfiniteTalk multi-person input requires one mask file or bbox for each person audio.")
+
+                background_mask += human_mask
+                human_masks.append(human_mask)
+        elif human_num == 1:
+            background_mask = torch.ones([self.src_h, self.src_w])
+            human_mask1 = torch.ones([self.src_h, self.src_w])
+            human_mask2 = torch.ones([self.src_h, self.src_w])
+            human_masks = [human_mask1, human_mask2, background_mask]
+        else:
+            if human_num > 2:
+                raise ValueError("InfiniteTalk 3+ person input requires mask_files or bbox for each person.")
+            face_scale = float(self.config.get("face_scale", 0.05))
+            x_min, x_max = int(self.src_h * face_scale), int(self.src_h * (1 - face_scale))
+            human_mask1 = torch.zeros([self.src_h, self.src_w])
+            human_mask2 = torch.zeros([self.src_h, self.src_w])
+            background_mask = torch.zeros([self.src_h, self.src_w])
+            lefty_min, lefty_max = int((self.src_w // 2) * face_scale), int((self.src_w // 2) * (1 - face_scale))
+            righty_min = int((self.src_w // 2) * face_scale + (self.src_w // 2))
+            righty_max = int((self.src_w // 2) * (1 - face_scale) + (self.src_w // 2))
+            human_mask1[x_min:x_max, lefty_min:lefty_max] = 1
+            human_mask2[x_min:x_max, righty_min:righty_max] = 1
+            background_mask += human_mask1 + human_mask2
+            human_masks = [human_mask1, human_mask2]
+
+        background_mask = torch.where(background_mask > 0, torch.tensor(0), torch.tensor(1))
+        human_masks.append(background_mask)
+
+        masks = torch.stack(human_masks, dim=0)
+        masks = self._resize_and_centercrop(masks, (self.target_h, self.target_w))
+        masks = F.interpolate(masks.unsqueeze(0), size=(latent_h, latent_w), mode="nearest").squeeze(0)
+        masks = (masks > 0).float().to(AI_DEVICE)
+        logger.info(f"InfiniteTalk ref_target_masks built: human_num={human_num}, mask_shape={tuple(masks.shape)}")
+        return masks
+
+    def _prepare_input_data(self):
+        input_data = self._load_input_data()
+        if self.input_info.prompt:
+            input_data["prompt"] = self.input_info.prompt
+        self.input_info.prompt = input_data["prompt"]
+
+        self.input_data = input_data
+        self.cond_file_path = self._prepare_cond_video_path(input_data["cond_video"])
+        self._clear_cond_frame_source()
+        logger.info(f"InfiniteTalk cond_video: {input_data['cond_video']}")
+        self.cond_video_duration = self._get_cond_video_duration(self.cond_file_path)
+        first_image = self._extract_specific_frame(self.cond_file_path, 0)
+        self.src_h, self.src_w, self.target_h, self.target_w = self._select_target_size(first_image)
+        self.input_info.size = [self.target_h, self.target_w]
+
+    @ProfilingContext4DebugL2("Run Encoders")
+    def _run_input_encoder_local_s2v(self):
+        full_audio_embs = self._prepare_audio_embeddings(self.input_data)
+        if any(audio_emb.shape[0] <= 0 for audio_emb in full_audio_embs):
+            raise ValueError("InfiniteTalk audio embeddings must be non-empty.")
+
+        text_encoder_output = self.run_text_encoder(self.input_info)
+        return {
+            "text_encoder_output": text_encoder_output,
+            "full_audio_embs": full_audio_embs,
+            "human_num": len(full_audio_embs),
+        }
+
+    def _slice_audio_embeddings(self, full_audio_embs, audio_start_idx, audio_end_idx):
+        indices = (torch.arange(2 * 2 + 1) - 2) * 1
+        audio_embs = []
+        for full_audio_emb in full_audio_embs:
+            center_indices = torch.arange(audio_start_idx, audio_end_idx, 1).unsqueeze(1) + indices.unsqueeze(0)
+            center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0] - 1)
+            audio_embs.append(full_audio_emb[center_indices][None])
+        return torch.concat(audio_embs, dim=0).to(AI_DEVICE, GET_DTYPE())
+
+    def _build_vae_encoder_out(self, cond_image, frame_num):
+        video_frames = torch.zeros(1, cond_image.shape[1], frame_num - cond_image.shape[2], self.target_h, self.target_w, device=AI_DEVICE)
+        padding_frames = torch.concat([cond_image, video_frames], dim=2)
+        y = self.vae_encoder.encode(padding_frames.to(GET_DTYPE())).to(GET_DTYPE())
+
+        latent_h, latent_w = y.shape[-2:]
+        msk = torch.ones(1, frame_num, latent_h, latent_w, device=AI_DEVICE)
+        msk[:, 1:] = 0
+        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, latent_h, latent_w)
+        msk = msk.transpose(1, 2).to(GET_DTYPE())[0]
+        return torch.concat([msk, y], dim=0)
+
+    def _build_clip_context(self, cond_image):
+        return self.run_image_encoder(cond_image[:, :, -1])
+
+    def _run_dit_clip(self, dit_inputs):
+        infer_steps = self.scheduler.infer_steps
+        for step_index in range(infer_steps):
+            self.check_stop()
+            logger.info(f"==> step_index: {step_index + 1} / {infer_steps}")
+            with ProfilingContext4DebugL1("step_pre"):
+                self.scheduler.step_pre(step_index)
+            with ProfilingContext4DebugL1("infer_main"):
+                self.model.infer(dit_inputs)
+            with ProfilingContext4DebugL1("step_post"):
+                self.scheduler.step_post()
+
+    def _resolve_video_duration(self):
+        video_duration = self.input_info.video_duration
+        if video_duration is None:
+            video_duration = self.config.get("video_duration", None)
+        if video_duration is None:
+            return None
+        return float(video_duration)
+
+    def resolve_frame_num(self):
+        frame_num = self.input_info.num_frames
+        if frame_num is None or frame_num <= 0:
+            frame_num = self.config["num_frames"]
+        return int(frame_num)
+
+    def _resolve_expected_frames(self):
+        audio_frames = min(int(audio_emb.shape[0]) for audio_emb in self.full_audio_embs)
+        if audio_frames <= 0:
+            raise ValueError("InfiniteTalk audio embeddings must be non-empty.")
+
+        audio_duration = audio_frames / self.target_fps
+        max_video_duration = self._resolve_video_duration()
+
+        if self.cond_video_duration is not None:
+            final_duration = min(audio_duration, self.cond_video_duration)
+            if max_video_duration is not None:
+                final_duration = min(final_duration, max_video_duration)
+            expected_frames = max(1, int(final_duration * self.target_fps))
+            logger.info(
+                f"InfiniteTalk duration resolved from audio/ref video/config: "
+                f"audio={audio_duration:.3f}s, ref_video={self.cond_video_duration:.3f}s, "
+                f"config_video_duration={max_video_duration}, final={expected_frames / self.target_fps:.3f}s"
+            )
+            return expected_frames
+
+        if max_video_duration is None:
+            requested_frames = audio_frames
+        else:
+            requested_frames = max(1, int(max_video_duration * self.target_fps))
+
+        expected_frames = min(requested_frames, audio_frames)
+        if expected_frames < requested_frames:
+            logger.warning(f"Input video_duration is greater than actual audio duration, using audio duration instead: audio_duration={audio_duration}, video_duration={max_video_duration}")
+        return expected_frames
+
+    def _segment_start_frame(self, segment_idx):
+        return segment_idx * self.segment_stride
+
+    def reuse_prefix_frame_count(self):
+        if not self.reuse_prefix_segments:
+            return 0
+        return self._segment_start_frame(self.reuse_prefix_segments) + self.motion_frame
+
+    def _ensure_audio_padding(self, audio_end_idx):
+        for idx, full_audio_emb in enumerate(self.full_audio_embs):
+            if audio_end_idx < full_audio_emb.shape[0]:
+                continue
+            miss_length = audio_end_idx - full_audio_emb.shape[0] + 3
+            add_audio_emb = torch.flip(full_audio_emb[-miss_length:], dims=[0])
+            self.full_audio_embs[idx] = torch.cat([full_audio_emb, add_audio_emb], dim=0)
+
+    def init_run(self):
+        self.frame_num = self.resolve_frame_num()
+        self.motion_frame = int(self.config.get("motion_frame", 9))
+        self.segment_stride = self.frame_num - self.motion_frame
+        if self.segment_stride <= 0:
+            raise ValueError(f"motion_frame must be smaller than num_frames, got motion_frame={self.motion_frame}, num_frames={self.frame_num}")
+
+        self.full_audio_embs = list(self.inputs["full_audio_embs"])
+        self.human_num = int(self.inputs["human_num"])
+        self.expected_frames = self._resolve_expected_frames()
+        self.seed = self.scheduler.seed_everything(self.input_info.seed)
+        logger.info(f"InfiniteTalk seed: {self.seed}")
+        logger.info(f"InfiniteTalk expected_frames: {self.expected_frames}, fps: {self.target_fps}, duration: {self.expected_frames / self.target_fps:.3f}s")
+
+        self.cond_image = self._prepare_cond_image(0)
+        self.cond_frame = None
+        self.gen_video_list = None if self.stream_save_video else []
+
+    def get_video_segment_num(self):
+        if self.expected_frames <= self.frame_num:
+            self.video_segment_num = 1
+        else:
+            self.video_segment_num = 1 + math.ceil((self.expected_frames - self.frame_num) / self.segment_stride)
+        logger.info(f"InfiniteTalk video segments: {self.video_segment_num}")
+
+    @ProfilingContext4DebugL1(
+        "Init run segment",
+        recorder_mode=GET_RECORDER_MODE(),
+        metrics_func=monitor_cli.lightx2v_run_init_run_segment_duration,
+        metrics_labels=["InfiniteTalkRunner"],
+    )
+    def init_run_segment(self, segment_idx):
+        self.segment_idx = segment_idx
+        self.is_first_segment = segment_idx == 0
+        self.current_motion_frames_num = 1 if self.is_first_segment else self.motion_frame
+        self.audio_start_idx = self._segment_start_frame(segment_idx)
+        self.audio_end_idx = self.audio_start_idx + self.frame_num
+        self._ensure_audio_padding(self.audio_end_idx)
+
+        audio_embs = self._slice_audio_embeddings(self.full_audio_embs, self.audio_start_idx, self.audio_end_idx)
+        clip_context = self._build_clip_context(self.cond_image)
+        vae_encoder_out = self._build_vae_encoder_out(self.cond_image, self.frame_num)
+        latent_h, latent_w = vae_encoder_out.shape[-2:]
+        cur_motion_frames_latent_num = int(1 + (self.current_motion_frames_num - 1) // 4)
+
+        if not self.is_first_segment and segment_idx == self.reuse_prefix_segments:
+            latent_motion_frames = self.load_cached_motion_latent(segment_idx - 1)
+        else:
+            if self.is_first_segment:
+                latent_motion_input = self.cond_image
+            else:
+                if self.cond_frame is None:
+                    raise RuntimeError("InfiniteTalk non-first segment requires previous decoded motion frames.")
+                latent_motion_input = self.cond_frame
+            latent_motion_frames = self.vae_encoder.encode(latent_motion_input.to(GET_DTYPE()))
+            if not self.is_first_segment:
+                self.save_motion_latent(segment_idx - 1, latent_motion_frames)
+
+        ref_target_masks = self._build_ref_target_masks(self.human_num, latent_h, latent_w)
+        latent_shape = (16, (self.frame_num - 1) // 4 + 1, latent_h, latent_w)
+        self.scheduler.prepare(
+            seed=self.seed,
+            latent_shape=latent_shape,
+            latent_motion_frames=latent_motion_frames,
+            is_first_clip=self.is_first_segment,
+            cur_motion_frames_latent_num=cur_motion_frames_latent_num,
+        )
+        self.dit_inputs = {
+            "text_encoder_output": self.inputs["text_encoder_output"],
+            "image_encoder_output": {
+                "clip_encoder_out": clip_context,
+                "vae_encoder_out": vae_encoder_out,
+            },
+            "audio_encoder_output": audio_embs,
+            "ref_target_masks": ref_target_masks,
+        }
+
+    def run_segment(self, segment_idx=0):
+        self._run_dit_clip(self.dit_inputs)
+        return self.scheduler.latents
+
+    def _should_stream_save_video(self):
+        return bool(self.config.get("stream_save_video", True) and not self.input_info.return_result_tensor and getattr(self.input_info, "save_result_path", None))
+
+    def _init_stream_video_controller(self):
+        if not self.stream_save_video:
+            return
+        self.va_controller = VAController(self)
+        logger.info(f"init va_recorder: {self.va_controller.recorder} and va_reader: {self.va_controller.reader}")
+
+    def _get_audio_segment(self, start_frame, frame_count):
+        audio_sample_start = int(round(start_frame * self.audio_sample_rate / self.target_fps))
+        audio_sample_end = int(round((start_frame + frame_count) * self.audio_sample_rate / self.target_fps))
+        audio_sample_count = max(audio_sample_end - audio_sample_start, 0)
+        if audio_sample_count == 0:
+            return torch.zeros(0, dtype=torch.float32)
+
+        if self.video_audio_array is None:
+            return torch.zeros(audio_sample_count, dtype=torch.float32)
+
+        audio = self.video_audio_array.reshape(-1)
+        audio_seg = audio[audio_sample_start : min(audio_sample_end, audio.shape[0])]
+        if audio_seg.shape[0] < audio_sample_count:
+            audio_seg = np.pad(audio_seg, (0, audio_sample_count - audio_seg.shape[0]))
+        return torch.from_numpy(audio_seg.astype(np.float32, copy=False))
+
+    def _publish_video_segment(self, videos, start_frame):
+        if self.va_controller is None or self.va_controller.recorder is None:
+            return
+        frame_count = videos.shape[2]
+        if frame_count <= 0:
+            return
+        video_seg = videos[:, :, :frame_count].to(torch.float32)
+        comfy_video = wan_vae_to_comfy(video_seg.cpu())
+        audio_seg = self._get_audio_segment(start_frame, frame_count)
+        self.va_controller.pub_livestream(
+            comfy_video,
+            audio_seg,
+            video_seg.cpu(),
+            valid_duration=frame_count / self.target_fps,
+        )
+
+    @ProfilingContext4DebugL1(
+        "End run segment",
+        recorder_mode=GET_RECORDER_MODE(),
+        metrics_func=monitor_cli.lightx2v_run_end_run_segment_duration,
+        metrics_labels=["InfiniteTalkRunner"],
+    )
+    def end_run_segment(self, segment_idx, latents):
+        videos = self.run_vae_decoder(latents).cpu()
+        if self.is_first_segment:
+            output_videos = videos
+            output_start_frame = 0
+        else:
+            output_videos = videos[:, :, self.current_motion_frames_num :]
+            output_start_frame = self.audio_start_idx + self.current_motion_frames_num
+
+        valid_frames = min(output_videos.shape[2], max(self.expected_frames - output_start_frame, 0))
+        if valid_frames > 0:
+            output_videos = output_videos[:, :, :valid_frames]
+            if self.stream_save_video:
+                self._publish_video_segment(output_videos, output_start_frame)
+            else:
+                self.gen_video_list.append(output_videos)
+
+        if segment_idx < self.video_segment_num - 1:
+            self.cond_frame = videos[:, :, -self.motion_frame :].to(torch.float32).to(AI_DEVICE)
+            if _is_video(self.cond_file_path):
+                self.cond_image = self._prepare_cond_image(self._segment_start_frame(segment_idx + 1))
+
+        del videos
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    @ProfilingContext4DebugL2("Run DiT + decode")
+    def run_main(self):
+        self.stream_save_video = self._should_stream_save_video()
+        self.init_run()
+        self.get_video_segment_num()
+        if self.reuse_prefix_segments >= self.video_segment_num:
+            raise ValueError(f"reuse_prefix_segments must be smaller than the video segment count ({self.video_segment_num})")
+
+        self.stage_reuse_cache()
+        self._init_stream_video_controller()
+
+        start_segment = self.reuse_prefix_segments
+        if start_segment:
+            if _is_video(self.cond_file_path):
+                self.cond_image = self._prepare_cond_image(self._segment_start_frame(start_segment))
+            self.scheduler.begin_request()
+
+        for segment_idx in range(start_segment, self.video_segment_num):
+            logger.info(f"start InfiniteTalk segment {segment_idx + 1}/{self.video_segment_num}")
+            with ProfilingContext4DebugL1(f"segment end2end {segment_idx + 1}/{self.video_segment_num}"):
+                self.check_stop()
+                self.init_run_segment(segment_idx)
+                latents = self.run_segment(segment_idx)
+                self.check_stop()
+                self.end_run_segment(segment_idx, latents)
+
+        if self.stream_save_video:
+            return self.process_images_after_vae_decoder()
+
+        suffix_frames = self.expected_frames - self.reuse_prefix_frame_count()
+        self.gen_video = torch.cat(self.gen_video_list, dim=2)[:, :, :suffix_frames].to(torch.float32)
+        return self.process_images_after_vae_decoder()
+
+    @ProfilingContext4DebugL1("Process after vae decoder")
+    def process_images_after_vae_decoder(self):
+        if self.stream_save_video:
+            if self.input_info.save_result_path is not None and is_main_process():
+                self.stream_saved_video_needs_audio_remux = not self.reuse_prefix_segments
+                logger.info(f"Video saved to {self.input_info.save_result_path}")
+            return {"video": None}
+
+        return_result_tensor = self.input_info.return_result_tensor
+        save_result = self.input_info.save_result_path is not None
+        main_process = is_main_process()
+
+        should_process = return_result_tensor or (save_result and main_process)
+        if not should_process:
+            self.gen_video_final = None
+            return {"video": None}
+
+        self.gen_video_final = wan_vae_to_comfy(self.gen_video)
+        if return_result_tensor:
+            self.gen_video_final = self.gen_video_final.cpu()
+            return {"video": self.gen_video_final}
+
+        # Reaching here means should_process was true because this is the main
+        # process and a save path was provided.
+        out_path = self.input_info.save_result_path
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        logger.info(f"Saving InfiniteTalk video to {out_path}")
+        save_to_video(self.gen_video_final, out_path, fps=self.target_fps, method="ffmpeg")
+        if self.reuse_prefix_segments:
+            logger.info(f"[Reuse] Saved regenerated InfiniteTalk suffix to {out_path}")
+            return {"video": None}
+        audio_input = getattr(self.input_info, "audio_path", None) or self.config.get("audio_path", "")
+        mux_audio = self._resolve_mux_audio_path()
+        if not mux_audio or not os.path.isfile(mux_audio):
+            self._remove_video_audio_path()
+            raise FileNotFoundError(f"InfiniteTalk mux audio is unavailable for audio input: {audio_input}")
+        try:
+            logger.info(f"Muxing InfiniteTalk audio {mux_audio} into {out_path}")
+            self._mux_audio(out_path, mux_audio)
+        finally:
+            self._remove_video_audio_path()
+        logger.info(f"Video saved to {out_path}")
+        return {"video": None}
+
+    def _resolve_mux_audio_path(self):
+        input_data = getattr(self, "input_data", {})
+        cond_audio = input_data.get("cond_audio", {}) if isinstance(input_data, dict) else {}
+        person_count = len(cond_audio) if isinstance(cond_audio, dict) else 0
+        audio_input = self.input_info.audio_path
+        if audio_input is None:
+            audio_input = self.config.get("audio_path", "")
+        if person_count <= 1 and audio_input:
+            audio_input = str(audio_input)
+            if not os.path.isdir(audio_input):
+                original_audio = audio_input.split(",")[0].strip()
+                if original_audio and os.path.isfile(original_audio):
+                    return original_audio
+        return self.video_audio_path
+
+    @staticmethod
+    def _is_same_file(path_a, path_b):
+        try:
+            return os.path.samefile(path_a, path_b)
+        except OSError:
+            return os.path.abspath(path_a) == os.path.abspath(path_b)
+
+    @staticmethod
+    def _mux_audio(video_path, audio_path, timeout=600):
+        if InfiniteTalkRunner._is_same_file(video_path, audio_path):
+            logger.warning(f"Skip audio mux because audio path is the output video itself: {audio_path}")
+            return
+
+        tmp_path = video_path + ".tmp.mp4"
+        base_cmd = [
+            ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-shortest",
+        ]
+        cmd = [
+            *base_cmd,
+            "-c:a",
+            "copy",
+            tmp_path,
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+            if res.returncode != 0:
+                # Fallback to aac re-encoding (e.g. for WAV/PCM inputs)
+                cmd = [
+                    *base_cmd,
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    tmp_path,
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+            os.replace(tmp_path, video_path)
+            logger.info(f"Muxed audio from {audio_path}")
+        except subprocess.TimeoutExpired as exc:
+            logger.error(f"Audio mux timed out after {timeout}s: {audio_path}")
+            raise RuntimeError(f"Audio mux timed out after {timeout}s: {audio_path}") from exc
+        except Exception as exc:
+            logger.error(f"Audio mux failed: {exc}")
+            raise
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def end_run(self):
+        if self.va_controller is not None:
+            self.va_controller.clear()
+            self.va_controller = None
+        if self.stream_saved_video_needs_audio_remux:
+            out_path = self.input_info.save_result_path
+            mux_audio = self._resolve_mux_audio_path()
+            try:
+                if not mux_audio or not os.path.isfile(mux_audio):
+                    audio_input = getattr(self.input_info, "audio_path", None) or self.config.get("audio_path", "")
+                    raise FileNotFoundError(f"InfiniteTalk mux audio is unavailable for audio input: {audio_input}")
+                if not os.path.isfile(out_path):
+                    raise FileNotFoundError(f"InfiniteTalk stream video is unavailable for audio mux: {out_path}")
+                logger.info(f"Muxing InfiniteTalk stream audio {mux_audio} into {out_path}")
+                self._mux_audio(out_path, mux_audio)
+            finally:
+                self.stream_saved_video_needs_audio_remux = False
+        self._remove_video_audio_path()
+        self._clear_cond_frame_source()
+        self._remove_cond_video_temp_path()
+        self.video_audio_array = None
+        self.stream_save_video = False
+        if hasattr(self, "inputs"):
+            del self.inputs
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    @ProfilingContext4DebugL1(
+        "RUN pipeline",
+        recorder_mode=GET_RECORDER_MODE(),
+        metrics_func=monitor_cli.lightx2v_worker_request_duration,
+        metrics_labels=["InfiniteTalkRunner"],
+    )
+    def run_pipeline(self, input_info):
+        if GET_RECORDER_MODE():
+            monitor_cli.lightx2v_worker_request_count.inc()
+        self.input_info = input_info
+        self.stream_saved_video_needs_audio_remux = False
+        self.prepare_reuse_output()
+
+        try:
+            try:
+                self._prepare_input_data()
+                self.inputs = self.load_reused_inputs() if self.reuse else self.run_input_encoder()
+                result = self.run_main()
+            finally:
+                self.end_run()
+            self.commit_reuse_result()
+        except Exception:
+            self.discard_reuse_result()
+            raise
+        finally:
+            if self.final_result_path is not None:
+                self.input_info.save_result_path = self.final_result_path
+        if GET_RECORDER_MODE():
+            monitor_cli.lightx2v_worker_request_success.inc()
+        return result

@@ -1,10 +1,9 @@
 {
     "infer_steps": 40,
-    "target_video_length": 81,
-    "target_height": 480,
-    "target_width": 832,
-    "self_attn_1_type": "sla_attn",
-    "sla_attn_setting": {
+    "num_frames": 81,
+    "size": [480, 832],
+    "self_attn_1_type": "dynamic_sparse_attn",
+    "dynamic_sparse_attn_setting": {
         "sparsity_ratio": 0.8,
         "operator": "triton"
     },

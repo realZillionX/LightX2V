@@ -1,16 +1,35 @@
 import gc
+import json
 from pathlib import Path
 
 import torch
 from fastapi import APIRouter, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 from loguru import logger
+from pydantic import ValidationError
 
 from ...schema import StopTaskResponse
 from ...task_manager import TaskStatus, task_manager
 from ..deps import get_services
+from ..files import _get_mime_type
 
 router = APIRouter()
+
+
+def parse_form_request(request_cls, request_data):
+    """Decode structured form fields and validate them with the JSON request schema."""
+    for field in ("size", "ref_image_paths", "image_frame_indices", "image_strength", "pose", "talk_objects"):
+        value = request_data.get(field)
+        if isinstance(value, str) and value.lstrip().startswith(("[", "{")):
+            try:
+                request_data[field] = json.loads(value)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"{field} must contain valid JSON") from exc
+    try:
+        return request_cls(**request_data)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(include_input=False)) from exc
 
 
 def _stream_file_response(file_path: Path, filename: str | None = None) -> StreamingResponse:
@@ -20,7 +39,10 @@ def _stream_file_response(file_path: Path, filename: str | None = None) -> Strea
     try:
         resolved_path = file_path.resolve()
 
-        if not str(resolved_path).startswith(str(services.file_service.output_video_dir.resolve())):
+        output_root = services.file_service.output_video_dir.resolve()
+        try:
+            resolved_path.relative_to(output_root)
+        except ValueError:
             raise HTTPException(status_code=403, detail="Access to this file is not allowed")
 
         if not resolved_path.exists() or not resolved_path.is_file():
@@ -29,11 +51,7 @@ def _stream_file_response(file_path: Path, filename: str | None = None) -> Strea
         file_size = resolved_path.stat().st_size
         actual_filename = filename or resolved_path.name
 
-        mime_type = "application/octet-stream"
-        if actual_filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-            mime_type = "video/mp4"
-        elif actual_filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
-            mime_type = "image/jpeg"
+        mime_type = _get_mime_type(actual_filename)
 
         headers = {
             "Content-Disposition": f'attachment; filename="{actual_filename}"',

@@ -21,7 +21,6 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
-from lightx2v.utils.custom_compiler import CompiledMethodsMixin, compiled_method
 from lightx2v.utils.envs import *
 from lightx2v.utils.ggml_tensor import load_gguf_sd_ckpt
 from lightx2v.utils.utils import *
@@ -41,7 +40,7 @@ SAFETENSORS_DTYPE_MAP = {
 }
 
 
-class BaseTransformerModel(CompiledMethodsMixin, ABC):
+class BaseTransformerModel(ABC):
     """Base class for all transformer models.
 
     This class provides common functionality that can be shared across
@@ -91,6 +90,19 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         self.dit_quantized = self.config.get("dit_quantized", False)
         if self.dit_quantized:
             self._check_dit_quantized()
+        self._init_tensor_parallel()
+
+    def _init_tensor_parallel(self):
+        if self.config.get("tensor_parallel", False):
+            self.use_tp = True
+            self.tp_group = self.config.get("device_mesh").get_group(mesh_dim="tensor_p")
+            self.tp_rank = dist.get_rank(self.tp_group)
+            self.tp_size = dist.get_world_size(self.tp_group)
+        else:
+            self.use_tp = False
+            self.tp_group = None
+            self.tp_rank = 0
+            self.tp_size = 1
 
     def _check_dit_quantized(self):
         """Check if the model is quantized.
@@ -100,6 +112,7 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         """
         assert self.config.get("dit_quant_scheme", "Default") in [
             "fp8-pertensor",
+            "fp8-musa",
             "fp8-triton",
             "int8-triton",
             "fp8-vllm",
@@ -107,7 +120,9 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             "int8-vllm-hygon-dcu",
             "fp8-q8f",
             "int8-q8f",
+            "int8-convrot",
             "fp8-b128-deepgemm",
+            "fp8-f16-accum",
             "fp8-sgl",
             "int8-sgl",
             "int8-torchao",
@@ -131,6 +146,8 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             "gguf-Q3_K_M",
             "int8-npu",
             "fp8-intel-xpu",
+            "int8-intel-xpu",
+            "int8-iluvatar",
         ]
 
     @abstractmethod
@@ -290,13 +307,10 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             # Single GPU mode
             return True
         elif dist.is_initialized():
-            if self.config.get("load_from_rank0", False):
-                # Multi-GPU mode, only rank 0 loads
-                if dist.get_rank() == 0:
-                    logger.info(f"Loading weights from {self.model_path}")
-                    return True
-            else:
-                return True
+            if self.use_tp or self.config.get("load_from_rank0", False):
+                # TP or explicit rank0-only loading: only rank 0 reads from disk
+                return dist.get_rank() == 0
+            return True
         return False
 
     def _apply_weights(self, weight_dict=None):
@@ -317,7 +331,7 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             self.post_weight.load(self.original_weight_dict)
 
         # Handle LoRA if needed
-        if self.config.get("lora_dynamic_apply", False):
+        if self.config.get("lora_dynamic_apply", False) and self.lora_path is not None:
             assert self.config.get("lora_configs", False)
             if hasattr(self, "_register_lora"):
                 self._register_lora(self.lora_path, self.lora_strength)
@@ -367,12 +381,14 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             lora_weight = self._load_lora_file(lora_path)
         self.pre_weight.update_lora(lora_weight, strength)
         self.transformer_weights.update_lora(lora_weight, strength)
-        self.post_weight.update_lora(lora_weight, strength)
+        if hasattr(self, "post_weight"):
+            self.post_weight.update_lora(lora_weight, strength)
 
     def _remove_lora(self):
         self.pre_weight.remove_lora()
         self.transformer_weights.remove_lora()
-        self.post_weight.remove_lora()
+        if hasattr(self, "post_weight"):
+            self.post_weight.remove_lora()
 
     def _load_safetensor_to_dict(self, file_path, unified_dtype, sensitive_layer):
         """Load a safetensors file into a dictionary.
@@ -388,10 +404,27 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None  # None means all keys are preserved, otherwise only keys in preserve_keys are preserved
 
-        if self.device.type != "cpu" and dist.is_initialized():
+        # In PipeFusion mode, load weights to CPU first to avoid OOM — each
+        # stage only needs a subset of block weights on GPU.
+        if self.config.get("pipefusion_parallel", False):
+            device = "cpu"
+        elif self.device.type != "cpu" and dist.is_initialized():
             device = dist.get_rank()
         else:
             device = str(self.device)
+
+        ext = os.path.splitext(file_path)[-1]
+        if ext in (".pt", ".pth", ".tar"):
+            state_dict = torch.load(file_path, map_location="cpu", weights_only=True)
+            if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            return {
+                key: (tensor.to(device=device, dtype=GET_DTYPE()) if unified_dtype or all(s not in key for s in sensitive_layer) else tensor.to(device=device, dtype=GET_SENSITIVE_DTYPE()))
+                for key, tensor in state_dict.items()
+                if isinstance(tensor, torch.Tensor)
+                and not any(remove_key in key for remove_key in remove_keys)
+                and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
+            }
 
         with safe_open(file_path, framework="pt", device=device) as f:
             return {
@@ -410,10 +443,11 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         Returns:
             dict: Dictionary of weights
         """
-        if self.config.get("dit_original_ckpt", None):
-            safetensors_path = self.config["dit_original_ckpt"]
-        else:
-            safetensors_path = self.model_path
+        _tp_dev = self.use_tp
+        if _tp_dev:
+            _saved_device, self.device = self.device, torch.device("cpu")
+
+        safetensors_path = self.config.get("dit_original_ckpt") or self.config.get("transformer_model_path") or self.model_path
 
         if os.path.isdir(safetensors_path):
             if self.lazy_load:
@@ -439,6 +473,8 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             file_weights = self._load_safetensor_to_dict(file_path, unified_dtype, sensitive_layer)
             weight_dict.update(file_weights)
 
+        if _tp_dev:
+            self.device = _saved_device
         return weight_dict
 
     def _load_quant_ckpt(self, unified_dtype, sensitive_layer):
@@ -451,6 +487,10 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         Returns:
             dict: Dictionary of weights
         """
+        _tp_dev = self.use_tp
+        if _tp_dev:
+            _saved_device, self.device = self.device, torch.device("cpu")
+
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
 
         if self.config.get("dit_quantized_ckpt", None):
@@ -468,6 +508,8 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             else:
                 gguf_path = safetensors_path
             weight_dict = self._load_gguf_ckpt(gguf_path)
+            if _tp_dev:
+                self.device = _saved_device
             return weight_dict
 
         if os.path.isdir(safetensors_path):
@@ -510,6 +552,8 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                 for k, v in calib_data["absmax"].items():
                     weight_dict[k.replace(".weight", ".input_absmax")] = v.to(self.device)
 
+        if _tp_dev:
+            self.device = _saved_device
         return weight_dict
 
     def _load_gguf_ckpt(self, gguf_path):
@@ -595,7 +639,6 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
 
         return distributed_weight_dict
 
-    @compiled_method()
     @abstractmethod
     @torch.no_grad()
     def _infer_cond_uncond(self, inputs, infer_condition=True):

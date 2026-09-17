@@ -14,7 +14,7 @@ class WanVaceTransformerInfer(WanOffloadTransformerInfer):
 
     def infer(self, weights, pre_infer_out):
         self.cos_sin = pre_infer_out.cos_sin
-        self.reset_infer_states()
+        self.reset_infer_states(pre_infer_out.x, pre_infer_out.context)
         pre_infer_out.c = self.vace_pre_process(weights.vace_patch_embedding, pre_infer_out.vace_context)
 
         # In seq parallel mode, chunk c to match pre_infer_out.x
@@ -36,12 +36,8 @@ class WanVaceTransformerInfer(WanOffloadTransformerInfer):
         # However, we can't know the exact original length due to padding
         # So we assume c's length matches the original x length (which may include padding)
 
-        # Get padding_multiple from config (same as used in _seq_parallel_pre_process)
-        padding_multiple = self.config.get("padding_multiple", 1)
-        multiple = world_size * padding_multiple
-
-        # Calculate padding for c to match the same chunking pattern as x
-        padding_size = (multiple - (c.shape[0] % multiple)) % multiple
+        # Pad/chunk c the same way as x in WanModel._seq_parallel_pre_process
+        padding_size = (world_size - (c.shape[0] % world_size)) % world_size
         if padding_size > 0:
             c = F.pad(c, (0, 0, 0, padding_size))
 

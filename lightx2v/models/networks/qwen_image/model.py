@@ -10,7 +10,6 @@ from lightx2v.models.networks.qwen_image.infer.transformer_infer import QwenImag
 from lightx2v.models.networks.qwen_image.weights.post_weights import QwenImagePostWeights
 from lightx2v.models.networks.qwen_image.weights.pre_weights import QwenImagePreWeights
 from lightx2v.models.networks.qwen_image.weights.transformer_weights import QwenImageTransformerWeights
-from lightx2v.utils.custom_compiler import compiled_method
 from lightx2v.utils.envs import *
 from lightx2v.utils.utils import *
 
@@ -42,6 +41,11 @@ class QwenImageTransformerModel(BaseTransformerModel):
         self.transformer_infer = self.transformer_infer_class(self.config)
         self.pre_infer = self.pre_infer_class(self.config)
         self.post_infer = self.post_infer_class(self.config)
+        first_block = self.transformer_weights.blocks[0]
+        self.pre_infer.set_rope(
+            img_rope=first_block.compute_phases[0].rope,
+            txt_rope=first_block.compute_phases[1].rope,
+        )
         if hasattr(self.transformer_infer, "offload_manager"):
             self._init_offload_manager()
 
@@ -87,7 +91,6 @@ class QwenImageTransformerModel(BaseTransformerModel):
         noise_pred = torch.cat(gathered_noise_pred, dim=1)
         return noise_pred
 
-    @compiled_method()
     @torch.no_grad()
     def infer(self, inputs):
         if self.cpu_offload:
@@ -105,6 +108,7 @@ class QwenImageTransformerModel(BaseTransformerModel):
             latents_input = latents
 
         if self.config["enable_cfg"]:
+            assert self.scheduler.sample_guide_scale is not None and self.scheduler.sample_guide_scale > 1.0, f"CFG requires sample_guide_scale > 1, got {self.scheduler.sample_guide_scale!r}"
             if self.config["cfg_parallel"]:
                 # ==================== CFG Parallel Processing ====================
                 cfg_p_group = self.config["device_mesh"].get_group(mesh_dim="cfg_p")
@@ -143,3 +147,10 @@ class QwenImageTransformerModel(BaseTransformerModel):
             if self.config["task"] == "i2i":
                 noise_pred = noise_pred[:, : latents.size(1)]
             self.scheduler.noise_pred = noise_pred
+
+        if self.cpu_offload:
+            if self.offload_granularity == "model" and self.scheduler.step_index == self.scheduler.infer_steps - 1:
+                self.to_cpu()
+            elif self.offload_granularity != "model":
+                self.pre_weight.to_cpu()
+                self.post_weight.to_cpu()

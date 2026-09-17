@@ -1,5 +1,6 @@
 from lightx2v.common.modules.weight_module import WeightModule
-from lightx2v.utils.registry_factory import MM_WEIGHT_REGISTER
+from lightx2v.common.ops.utils import move_transposed_weight_module_to_device
+from lightx2v.utils.registry_factory import LN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER
 
 
 class Flux2PostWeights(WeightModule):
@@ -12,6 +13,9 @@ class Flux2PostWeights(WeightModule):
         self.out_channels = config.get("transformer_in_channels", config.get("in_channels", 64))
         self.patch_size = config.get("patch_size", 1)
         self.mm_type = config.get("dit_quant_scheme", "Default")
+        self.layer_norm_type = config.get("layer_norm_type", "torch")
+
+        self.add_module("norm_out", LN_WEIGHT_REGISTER[self.layer_norm_type](eps=1e-5))
 
         self.add_module(
             "norm_out_linear",
@@ -30,7 +34,11 @@ class Flux2PostWeights(WeightModule):
     def to_cuda(self, non_blocking=True):
         for module in self._modules.values():
             if module is not None and hasattr(module, "to_cuda"):
-                module.to_cuda(non_blocking=non_blocking)
+                if self.mm_type == "Default":
+                    # The fast path assumes Default's 2-D transpose views; quantized layouts need their own to_cuda().
+                    move_transposed_weight_module_to_device(module, non_blocking=non_blocking)
+                else:
+                    module.to_cuda(non_blocking=non_blocking)
 
     def to_cpu(self, non_blocking=True):
         for module in self._modules.values():

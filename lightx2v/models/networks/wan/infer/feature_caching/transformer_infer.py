@@ -125,7 +125,6 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
                 x = self.infer_using_cache(pre_infer_out.x)
 
         if self.clean_cuda_cache:
-            del grid_sizes, embed, embed0, seq_lens, freqs, context
             torch.cuda.empty_cache()
 
         return x
@@ -185,7 +184,7 @@ class WanTransformerInferTaylorCaching(WanTransformerInferCaching, BaseTaylorCac
     # 1. get taylor step_diff when there is two caching_records in scheduler
     def get_taylor_step_diff(self):
         step_diff = 0
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             current_step = self.scheduler.step_index
             last_calc_step = current_step - 1
             while last_calc_step >= 0 and not self.scheduler.caching_records[last_calc_step]:
@@ -201,7 +200,7 @@ class WanTransformerInferTaylorCaching(WanTransformerInferCaching, BaseTaylorCac
         return step_diff
 
     def infer(self, weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             index = self.scheduler.step_index
             caching_records = self.scheduler.caching_records
 
@@ -219,9 +218,6 @@ class WanTransformerInferTaylorCaching(WanTransformerInferCaching, BaseTaylorCac
             else:
                 x = self.infer_using_cache(weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context)
 
-        if self.config["enable_cfg"]:
-            self.switch_status()
-
         return x
 
     def infer_calculating(self, weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context):
@@ -229,19 +225,19 @@ class WanTransformerInferTaylorCaching(WanTransformerInferCaching, BaseTaylorCac
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = self.infer_modulation(weights.blocks[block_idx].compute_phases[0], embed0)
 
             y_out = self.infer_self_attn(weights.blocks[block_idx].compute_phases[1], grid_sizes, x, seq_lens, freqs, shift_msa, scale_msa)
-            if self.infer_conditional:
+            if self.scheduler.infer_condition:
                 self.derivative_approximation(self.blocks_cache_even[block_idx], "self_attn_out", y_out)
             else:
                 self.derivative_approximation(self.blocks_cache_odd[block_idx], "self_attn_out", y_out)
 
             x, attn_out = self.infer_cross_attn(weights.blocks[block_idx].compute_phases[2], x, context, y_out, gate_msa)
-            if self.infer_conditional:
+            if self.scheduler.infer_condition:
                 self.derivative_approximation(self.blocks_cache_even[block_idx], "cross_attn_out", attn_out)
             else:
                 self.derivative_approximation(self.blocks_cache_odd[block_idx], "cross_attn_out", attn_out)
 
-            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa)
-            if self.infer_conditional:
+            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa, c_gate_msa)
+            if self.scheduler.infer_condition:
                 self.derivative_approximation(self.blocks_cache_even[block_idx], "ffn_out", y_out)
             else:
                 self.derivative_approximation(self.blocks_cache_odd[block_idx], "ffn_out", y_out)
@@ -260,7 +256,7 @@ class WanTransformerInferTaylorCaching(WanTransformerInferCaching, BaseTaylorCac
         _, _, gate_msa, _, _, c_gate_msa = self.infer_modulation(weights.compute_phases[0], embed0)
 
         # 2. residual and taylor
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             out = self.taylor_formula(self.blocks_cache_even[i]["self_attn_out"])
             out = out * gate_msa.squeeze(0)
             x = x + out
@@ -324,7 +320,7 @@ class WanTransformerInferAdaCaching(WanTransformerInferCaching):
         self.args_odd = AdaArgs(config)
 
     def infer(self, weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             index = self.scheduler.step_index
             caching_records = self.scheduler.caching_records
 
@@ -338,7 +334,7 @@ class WanTransformerInferAdaCaching(WanTransformerInferCaching):
                         if (index + i) <= self.scheduler.infer_steps - 1:
                             self.scheduler.caching_records[index + i] = False
             else:
-                x = self.infer_using_cache(weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context)
+                x = self.infer_using_cache(x)
 
         else:
             index = self.scheduler.step_index
@@ -354,10 +350,7 @@ class WanTransformerInferAdaCaching(WanTransformerInferCaching):
                         if (index + i) <= self.scheduler.infer_steps - 1:
                             self.scheduler.caching_records_2[index + i] = False
             else:
-                x = self.infer_using_cache(xt)
-
-        if self.config["enable_cfg"]:
-            self.switch_status()
+                x = self.infer_using_cache(x)
 
         return x
 
@@ -369,30 +362,30 @@ class WanTransformerInferAdaCaching(WanTransformerInferCaching):
 
             y_out = self.infer_self_attn(weights.blocks[block_idx].compute_phases[1], grid_sizes, x, seq_lens, freqs, shift_msa, scale_msa)
             if block_idx == self.decisive_double_block_id:
-                if self.infer_conditional:
+                if self.scheduler.infer_condition:
                     self.args_even.now_residual_tiny = y_out * gate_msa.squeeze(0)
                 else:
                     self.args_odd.now_residual_tiny = y_out * gate_msa.squeeze(0)
 
             x, attn_out = self.infer_cross_attn(weights.blocks[block_idx].compute_phases[2], x, context, y_out, gate_msa)
-            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa)
+            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa, c_gate_msa)
             x = self.post_process(x, y_out, c_gate_msa)
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             self.args_even.previous_residual = x - ori_x
         else:
             self.args_odd.previous_residual = x - ori_x
         return x
 
     def infer_using_cache(self, x):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             x += self.args_even.previous_residual
         else:
             x += self.args_odd.previous_residual
         return x
 
     def calculate_skip_step_length(self):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             if self.args_even.previous_residual_tiny is None:
                 self.args_even.previous_residual_tiny = self.args_even.now_residual_tiny
                 return 1
@@ -550,7 +543,7 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
     # 1. get taylor step_diff when there is two caching_records in scheduler
     def get_taylor_step_diff(self):
         step_diff = 0
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             current_step = self.scheduler.step_index
             last_calc_step = current_step - 1
             while last_calc_step >= 0 and not self.scheduler.caching_records[last_calc_step]:
@@ -572,7 +565,7 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
 
         # 2. L1 calculate
         should_calc = False
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                 should_calc = True
                 self.accumulated_rel_l1_distance_even = 0
@@ -604,7 +597,7 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
         return should_calc
 
     def infer(self, weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             index = self.scheduler.step_index
             caching_records = self.scheduler.caching_records
             if index <= self.scheduler.infer_steps - 1:
@@ -628,9 +621,6 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
             else:
                 x = self.infer_using_cache(x)
 
-        if self.config["enable_cfg"]:
-            self.switch_status()
-
         self.cnt += 1
 
         return x
@@ -643,10 +633,10 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
 
             y_out = self.infer_self_attn(weights.blocks[block_idx].compute_phases[1], grid_sizes, x, seq_lens, freqs, shift_msa, scale_msa)
             x, attn_out = self.infer_cross_attn(weights.blocks[block_idx].compute_phases[2], x, context, y_out, gate_msa)
-            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa)
+            y_out = self.infer_ffn(weights.blocks[block_idx].compute_phases[3], x, attn_out, c_shift_msa, c_scale_msa, c_gate_msa)
             x = self.post_process(x, y_out, c_gate_msa)
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             self.previous_residual_even = x - ori_x
             self.derivative_approximation(self.cache_even, "previous_residual", self.previous_residual_even)
         else:
@@ -655,7 +645,7 @@ class WanTransformerInferCustomCaching(WanTransformerInferCaching, BaseTaylorCac
         return x
 
     def infer_using_cache(self, x):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             x += self.taylor_formula(self.cache_even["previous_residual"])
         else:
             x += self.taylor_formula(self.cache_odd["previous_residual"])
@@ -706,7 +696,7 @@ class WanTransformerInferFirstBlock(WanTransformerInferCaching):
         x_residual = x - ori_x
         del ori_x
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             index = self.scheduler.step_index
             caching_records = self.scheduler.caching_records
             if index <= self.scheduler.infer_steps - 1:
@@ -730,15 +720,12 @@ class WanTransformerInferFirstBlock(WanTransformerInferCaching):
             else:
                 x = self.infer_using_cache(x)
 
-        if self.config["enable_cfg"]:
-            self.switch_status()
-
         return x
 
     def calculate_should_calc(self, x_residual):
         diff = 1.0
         x_residual_downsampled = x_residual[..., :: self.downsample_factor]
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             if self.prev_first_block_residual_even is not None:
                 t1 = self.prev_first_block_residual_even
                 t2 = x_residual_downsampled
@@ -772,7 +759,7 @@ class WanTransformerInferFirstBlock(WanTransformerInferCaching):
                 context,
             )
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             self.prev_remaining_blocks_residual_even = x - ori_x
         else:
             self.prev_remaining_blocks_residual_odd = x - ori_x
@@ -781,7 +768,7 @@ class WanTransformerInferFirstBlock(WanTransformerInferCaching):
         return x
 
     def infer_using_cache(self, x):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             return x.add_(self.prev_remaining_blocks_residual_even)
         else:
             return x.add_(self.prev_remaining_blocks_residual_odd)
@@ -821,7 +808,7 @@ class WanTransformerInferDualBlock(WanTransformerInferCaching):
         x_residual = x - ori_x
         del ori_x
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             index = self.scheduler.step_index
             caching_records = self.scheduler.caching_records
             if index <= self.scheduler.infer_steps - 1:
@@ -857,15 +844,12 @@ class WanTransformerInferDualBlock(WanTransformerInferCaching):
                 context,
             )
 
-        if self.config["enable_cfg"]:
-            self.switch_status()
-
         return x
 
     def calculate_should_calc(self, x_residual):
         diff = 1.0
         x_residual_downsampled = x_residual[..., :: self.downsample_factor]
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             if self.prev_front_blocks_residual_even is not None:
                 t1 = self.prev_front_blocks_residual_even
                 t2 = x_residual_downsampled
@@ -899,7 +883,7 @@ class WanTransformerInferDualBlock(WanTransformerInferCaching):
                 context,
             )
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             self.prev_middle_blocks_residual_even = x - ori_x
         else:
             self.prev_middle_blocks_residual_odd = x - ori_x
@@ -908,7 +892,7 @@ class WanTransformerInferDualBlock(WanTransformerInferCaching):
         return x
 
     def infer_using_cache(self, x):
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             return x.add_(self.prev_middle_blocks_residual_even)
         else:
             return x.add_(self.prev_middle_blocks_residual_odd)
@@ -941,7 +925,7 @@ class WanTransformerInferDynamicBlock(WanTransformerInferCaching):
     def infer_block(self, weights, grid_sizes, embed, x, embed0, seq_lens, freqs, context, block_idx):
         ori_x = x.clone()
 
-        if self.infer_conditional:
+        if self.scheduler.infer_condition:
             if self.block_in_cache_even[block_idx] is not None:
                 should_calc = self.are_two_tensor_similar(self.block_in_cache_even[block_idx], x)
                 if should_calc or self.must_calc(block_idx):

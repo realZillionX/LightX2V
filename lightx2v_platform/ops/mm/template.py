@@ -3,11 +3,48 @@ from abc import ABCMeta, abstractmethod
 
 import torch
 
+from lightx2v.utils.quant_utils import FloatQuantizer, IntegerQuantizer
 from lightx2v_platform.base.global_var import AI_DEVICE
+
+try:
+    from lightx2v_kernel.gemm import (
+        scaled_mxfp4_quant,
+        scaled_mxfp6_quant,
+        scaled_mxfp8_quant,
+        scaled_nvfp4_quant,
+    )
+except ImportError:
+    scaled_mxfp4_quant = None
+    scaled_mxfp6_quant = None
+    scaled_mxfp8_quant = None
+    scaled_nvfp4_quant = None
+
+try:
+    from vllm import _custom_ops as ops
+except ImportError:
+    ops = None
+
+try:
+    import sgl_kernel
+except ImportError:
+    sgl_kernel = None
+
+try:
+    import deep_gemm
+except ImportError:
+    deep_gemm = None
+
+try:
+    from torchao.quantization.utils import quantize_activation_per_token_absmax
+except ImportError:
+    try:
+        from torchao.quantization.utils import _quantize_activation_per_token_absmax as quantize_activation_per_token_absmax
+    except ImportError:
+        quantize_activation_per_token_absmax = None
 
 
 class MMWeightTemplate(metaclass=ABCMeta):
-    def __init__(self, weight_name, bias_name, create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_file=None, is_post_adapter=False):
+    def __init__(self, weight_name, bias_name, create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_file=None, is_post_adapter=False, lora_prefix="", lora_path=""):
         self.weight_name = weight_name
         self.bias_name = bias_name
         self.create_cuda_buffer = create_cuda_buffer
@@ -16,6 +53,8 @@ class MMWeightTemplate(metaclass=ABCMeta):
         self.lazy_load_file = lazy_load_file
         self.is_post_adapter = is_post_adapter
         self.config = {}
+        self.lora_prefix = lora_prefix
+        self.lora_path = lora_path
 
     @abstractmethod
     def load(self, weight_dict):
@@ -27,6 +66,20 @@ class MMWeightTemplate(metaclass=ABCMeta):
 
     def set_config(self, config={}):
         self.config = config
+
+    def _get_actual_weight(self):
+        """Return the effective weight used by fused-weight builders."""
+        if not hasattr(self, "weight_diff"):
+            return self.weight
+        return self.weight + self.weight_diff
+
+    def _get_actual_bias(self, bias=None):
+        """Return the effective bias used by fused-weight builders."""
+        if bias is None:
+            bias = getattr(self, "bias", None)
+        if bias is None or not hasattr(self, "bias_diff"):
+            return bias
+        return bias + self.bias_diff
 
     def to_cuda(self, non_blocking=False):
         self.weight = self.pin_weight.to(AI_DEVICE, non_blocking=non_blocking)

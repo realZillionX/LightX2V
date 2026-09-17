@@ -5,8 +5,8 @@ from .utils.sla_util import get_block_map
 from .utils.sparge_util import block_map_ordinal_lut_triton, get_block_map_meansim
 
 try:
-    from flash_attn import flash_attn_func_v2
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func_v2
+    from flash_attn import flash_attn_func as flash_attn_func_v2
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v2
 except ImportError:
     logger.info("flash_attn2 not found, please install flash_attn2 first")
     flash_attn_func_v2 = None
@@ -22,9 +22,11 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_func as flash_attn_func_v4
-except ImportError:
-    logger.info("flash_attn.cute not found, please install flashattention4 first")
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+except (ImportError, AttributeError) as exc:
+    logger.info(f"FlashAttention 4 is unavailable: {exc}")
     flash_attn_func_v4 = None
+    BlockSparseTensorsTorch = None
 
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
@@ -48,27 +50,26 @@ class FlashAttn2Weight(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        causal = kwargs.get("causal", False)
+        softmax_scale = kwargs.get("softmax_scale", None)
         if len(q.shape) == 3:
             bs = 1
+            total_seqlen = q.shape[0]
         elif len(q.shape) == 4:
             bs = q.shape[0]
-        total_seqlen = bs * max_seqlen_q
+            total_seqlen = bs * q.shape[1]
 
         if bs == 1:
             if len(q.shape) == 3:
                 q = q.unsqueeze(0)
                 k = k.unsqueeze(0)
                 v = v.unsqueeze(0)
-            x = flash_attn_func_v2(q, k, v).reshape(bs * max_seqlen_q, -1)
+            x = flash_attn_func_v2(q, k, v, softmax_scale=softmax_scale, causal=causal).reshape(total_seqlen, -1)
         else:
             if cu_seqlens_q.is_cpu:
                 cu_seqlens_q = cu_seqlens_q.to(q.device, non_blocking=True)
             if cu_seqlens_kv.is_cpu:
                 cu_seqlens_kv = cu_seqlens_kv.to(k.device, non_blocking=True)
-            if max_seqlen_q.is_cpu:
-                max_seqlen_q = max_seqlen_q.to(q.device, non_blocking=True)
-            if max_seqlen_kv.is_cpu:
-                max_seqlen_kv = max_seqlen_kv.to(k.device, non_blocking=True)
             if len(q.shape) == 4:
                 q = q.reshape(-1, q.shape[-2], q.shape[-1])
                 k = k.reshape(-1, k.shape[-2], k.shape[-1])
@@ -81,9 +82,32 @@ class FlashAttn2Weight(AttnWeightTemplate):
                 cu_seqlens_kv,
                 max_seqlen_q,
                 max_seqlen_kv,
+                softmax_scale=softmax_scale,
+                causal=causal,
             ).reshape(total_seqlen, -1)
 
         return x
+
+    def apply_with_lse(self, q, k, v, softmax_scale=None):
+        """Apply one dense attention block and return LSE as [tokens, heads]."""
+        if flash_attn_func_v2 is None:
+            raise ImportError("FlashAttention2 is not installed.")
+        if q.ndim == 3:
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        elif q.ndim != 4:
+            raise ValueError(f"Dense FlashAttention2 expects 3D or 4D Q/K/V, got q.ndim={q.ndim}.")
+
+        output, lse, *_ = flash_attn_func_v2(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_attn_probs=True,
+        )
+        output = output.reshape(q.shape[0] * q.shape[1], -1)
+        lse = lse.transpose(1, 2).reshape(q.shape[0] * q.shape[1], q.shape[2])
+        return output, lse
 
 
 @ATTN_WEIGHT_REGISTER("flash_attn3")
@@ -102,27 +126,26 @@ class FlashAttn3Weight(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        causal = kwargs.get("causal", False)
+        softmax_scale = kwargs.get("softmax_scale", None)
         if len(q.shape) == 3:
             bs = 1
+            total_seqlen = q.shape[0]
         elif len(q.shape) == 4:
             bs = q.shape[0]
-        total_seqlen = bs * max_seqlen_q
+            total_seqlen = bs * q.shape[1]
 
         if bs == 1:
             if len(q.shape) == 3:
                 q = q.unsqueeze(0)
                 k = k.unsqueeze(0)
                 v = v.unsqueeze(0)
-            x = flash_attn_func_v3(q, k, v).reshape(bs * max_seqlen_q, -1)
+            x = flash_attn_func_v3(q, k, v, softmax_scale=softmax_scale, causal=causal).reshape(total_seqlen, -1)
         else:
             if cu_seqlens_q.is_cpu:
                 cu_seqlens_q = cu_seqlens_q.to(q.device, non_blocking=True)
             if cu_seqlens_kv.is_cpu:
                 cu_seqlens_kv = cu_seqlens_kv.to(k.device, non_blocking=True)
-            if max_seqlen_q.is_cpu:
-                max_seqlen_q = max_seqlen_q.to(q.device, non_blocking=True)
-            if max_seqlen_kv.is_cpu:
-                max_seqlen_kv = max_seqlen_kv.to(k.device, non_blocking=True)
             if len(q.shape) == 4:
                 q = q.reshape(-1, q.shape[-2], q.shape[-1])
                 k = k.reshape(-1, k.shape[-2], k.shape[-1])
@@ -135,9 +158,32 @@ class FlashAttn3Weight(AttnWeightTemplate):
                 cu_seqlens_kv,
                 max_seqlen_q,
                 max_seqlen_kv,
+                softmax_scale=softmax_scale,
+                causal=causal,
             ).reshape(total_seqlen, -1)
 
         return x
+
+    def apply_with_lse(self, q, k, v, softmax_scale=None):
+        """Apply one dense attention block and return LSE as [tokens, heads]."""
+        if flash_attn_func_v3 is None:
+            raise ImportError("FlashAttention3 is not installed.")
+        if q.ndim == 3:
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        elif q.ndim != 4:
+            raise ValueError(f"Dense FlashAttention3 expects 3D or 4D Q/K/V, got q.ndim={q.ndim}.")
+
+        output, lse, *_ = flash_attn_func_v3(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_attn_probs=True,
+        )
+        output = output.reshape(q.shape[0] * q.shape[1], -1)
+        lse = lse.transpose(1, 2).reshape(q.shape[0] * q.shape[1], q.shape[2])
+        return output, lse
 
 
 @ATTN_WEIGHT_REGISTER("flash_attn4")
@@ -167,7 +213,7 @@ class FlashAttn4Weight(AttnWeightTemplate):
             k,
             v,
         )
-        x = x.reshape(bs * max_seqlen_q, -1)
+        x = x.reshape(q.shape[1], -1)
         return x
 
 
@@ -214,16 +260,19 @@ class SparseFlashAttn4Weight(AttnWeightTemplate):
         full_block_idx, full_block_cnt = block_map_ordinal_lut_triton(sparse_map)
         mask_block_cnt = torch.zeros_like(full_block_cnt)
         mask_block_idx = torch.zeros_like(full_block_idx)
-
-        x, _ = flash_attn_func_v4(
-            q=q,
-            k=k,
-            v=v,
+        block_sparse_tensors = BlockSparseTensorsTorch(
             mask_block_cnt=mask_block_cnt,
             mask_block_idx=mask_block_idx,
             full_block_cnt=full_block_cnt,
             full_block_idx=full_block_idx,
             block_size=(self.BLKQ, self.BLKK),
+        )
+
+        x, _ = flash_attn_func_v4(
+            q=q,
+            k=k,
+            v=v,
+            block_sparse_tensors=block_sparse_tensors,
         )
 
         x = x.reshape(bs * max_seqlen_q, -1)

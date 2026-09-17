@@ -6,9 +6,8 @@
     "vae_type": "mg_lightvae_v2",
     "lightvae_pruning_rate": 0.75,
 
-    "target_video_length": 57,
-    "target_height": 704,
-    "target_width": 1280,
+    "num_frames": 57,
+    "size": [704, 1280],
     "vae_stride": [4, 16, 16],
     "patch_size": [1, 2, 2],
 
@@ -35,7 +34,6 @@
     "cross_attn_2_type": "flash_attn2",
 
     "cpu_offload": false,
-    "cpu_offload_activations": false,
     "offload_granularity": "block",
     "seq_parallel": false,
     "parallel": {},

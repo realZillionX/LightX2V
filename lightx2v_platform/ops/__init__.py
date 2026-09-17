@@ -7,20 +7,48 @@ if PLATFORM == "cambricon_mlu":
     from .attn.cambricon_mlu import *
     from .mm.cambricon_mlu import *
     from .norm.cambricon_mlu import *
+    from .rope.cambricon_mlu import *
 elif PLATFORM == "hygon_dcu":
     from .attn.hygon_dcu import *
     from .mm.hygon_dcu import *
 elif PLATFORM == "amd_rocm":
     from .attn.amd_rocm import *
 elif PLATFORM == "ascend_npu":
+    # Register A2A first because Ascend attention may import the common
+    # Ulysses backend factory. Keep MoE before MM: MM imports common utilities
+    # that snapshot the platform registries during lightx2v initialization.
+    # isort: off
+    from .a2a.ascend_npu import *
     from .attn.ascend_npu import *
+    from .moe.ascend_npu import *
     from .mm.ascend_npu import *
+    from .norm.ascend_npu import *
+    from .rope.ascend_npu import *
+    # isort: on
 elif PLATFORM == "metax_cuda":
+    # Register every platform implementation before framework registries take
+    # their one-time snapshot. Keep attention last to preserve that boundary.
+    # isort: off
+    from .moe.metax_cuda import *
+    from .norm.metax_cuda import *
+    from .rope.metax_cuda import *
     from .attn.metax_cuda import *
+    # isort: on
 elif PLATFORM == "enflame_gcu":
     from .attn.enflame_gcu import *
     from .norm.enflame_gcu import *
     from .rope.enflame_gcu import *
 elif PLATFORM == "intel_xpu":
+    # Register platform implementations before the attention modules import
+    # the framework registry and snapshot all PLATFORM_* registries.
+    from .norm.intel_xpu import *  # noqa: I001
+    from .rope.intel_xpu import *
     from .attn.intel_xpu import *
     from .mm.intel_xpu import *
+elif PLATFORM == "iluvatar_cuda":
+    from .attn.iluvatar_cuda import *
+    from .mm.iluvatar_cuda import *
+    from .norm.iluvatar_cuda import *
+    from .rope.iluvatar_cuda import *
+elif PLATFORM == "musa":
+    from .mm.mthreads_musa import *

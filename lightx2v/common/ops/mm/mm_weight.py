@@ -6,6 +6,17 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
+try:
+    from magi_compiler import magi_register_custom_op
+except ImportError:
+    magi_register_custom_op = None
+
+from lightx2v.common.ops.mm.fp8_f16_accum import (
+    fp8_f16_accum_linear,
+    fp8_f16_accum_mm_available,
+    validate_fp8_f16_accum_qmax,
+)
+from lightx2v.common.ops.mm.sgl_kernel import sgl_fp8_scaled_mm, sgl_fp8_scaled_mm_meta
 from lightx2v.common.ops.mm.triton_kernels import (
     fp8_gemm_bias_triton,
     fp8_gemm_triton,
@@ -57,6 +68,60 @@ except ImportError:
     sgl_kernel = None
 
 try:
+    import comfy_kitchen
+except ImportError:
+    comfy_kitchen = None
+
+
+if comfy_kitchen is not None:
+    # Keep comfy-kitchen's DLPack implementation opaque to FakeTensor tracing.
+    @torch.library.custom_op(
+        "lightx2v::int8_convrot_linear",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def _int8_convrot_linear(
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        convrot_groupsize: int,
+    ) -> torch.Tensor:
+        return comfy_kitchen.int8_linear(
+            input_tensor,
+            weight,
+            weight_scale,
+            bias,
+            out_dtype=out_dtype,
+            convrot=True,
+            convrot_groupsize=convrot_groupsize,
+        )
+
+    @_int8_convrot_linear.register_fake
+    def _int8_convrot_linear_fake(input_tensor, weight, weight_scale, bias, out_dtype, convrot_groupsize):
+        return input_tensor.new_empty((*input_tensor.shape[:-1], weight.shape[0]), dtype=out_dtype)
+
+
+if magi_register_custom_op is not None and sgl_kernel is not None:
+
+    @magi_register_custom_op(
+        "lightx2v::fp8_scaled_mm",
+        infer_output_meta_fn=sgl_fp8_scaled_mm_meta,
+        is_subgraph_boundary=True,
+    )
+    def _fp8_scaled_mm(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scales_a: torch.Tensor,
+        scales_b: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return sgl_fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
+
+
+try:
     from q8_kernels.functional.linear import q8_linear
 except ImportError:
     q8_linear = None
@@ -98,13 +163,6 @@ try:
     import marlin_cuda_quant
 except ImportError:
     marlin_cuda_quant = None
-
-try:
-    import sycl_kernels
-except ImportError:
-    sycl_kernels = None
-
-import torch.distributed as dist
 
 
 class MMWeightTemplate(metaclass=ABCMeta):
@@ -1308,6 +1366,53 @@ class MMWeightWnvfp4Anvfp4dynamic(MMWeightQuantTemplate):
             del weight_scale_tensor
 
 
+@MM_WEIGHT_REGISTER("nvfp4-split-n-workaround")
+class MMWeightWnvfp4Anvfp4dynamicSplitNWorkaround(MMWeightWnvfp4Anvfp4dynamic):
+    """Temporary application-level two-way split-N workaround.
+
+    This path is intentionally separate from the normal ``nvfp4`` weight type.
+    It works around a throughput cliff observed for large Wan FFN GEMMs on
+    NVIDIA Jetson AGX Thor by quantizing the activation once, launching two
+    serial N/2 GEMMs, and concatenating their outputs.
+
+    This is not the desired long-term backend design: it adds another kernel
+    launch, temporary output tensors, and a concatenation. Remove this class,
+    its registry entry, and ``nvfp4_ffn_split_n_workaround`` once
+    ``cutlass_scaled_nvfp4_mm`` can select an architecture/shape-aware tactic
+    (or an internal split-N implementation that writes directly to the final
+    output).
+    """
+
+    split_n_parts = 2
+    split_n_alignment = 128
+
+    def apply(self, input_tensor):
+        input_tensor_quant, input_tensor_scale = self.act_quant_func(input_tensor)
+
+        n = self.weight.shape[0]
+        required_alignment = self.split_n_parts * self.split_n_alignment
+        if n % required_alignment != 0:
+            raise ValueError(f"NVFP4 split-N requires each N shard to be aligned to {self.split_n_alignment} rows, but {self.weight_name} has N={n}")
+        if self.weight_scale.shape[0] != n:
+            raise ValueError(f"NVFP4 split-N expects weight and weight_scale to share the output-channel dimension, got {n} and {self.weight_scale.shape[0]} for {self.weight_name}")
+
+        shard_n = n // self.split_n_parts
+        outputs = []
+        for start in range(0, n, shard_n):
+            bias = None if self.bias is None else self.bias.narrow(0, start, shard_n)
+            outputs.append(
+                cutlass_scaled_nvfp4_mm(
+                    input_tensor_quant,
+                    self.weight.narrow(0, start, shard_n),
+                    input_tensor_scale,
+                    self.weight_scale.narrow(0, start, shard_n),
+                    alpha=self.alpha,
+                    bias=bias,
+                )
+            )
+        return torch.cat(outputs, dim=-1)
+
+
 @MM_WEIGHT_REGISTER("CalibMax")
 class MMCalibMax(MMWeight):
     """Max-absmax calibration: record max(|input|) across every forward.
@@ -1682,6 +1787,109 @@ class MMWeightWint8channelAint8channeldynamicTriton(MMWeightQuantTemplate):
         return output_tensor.squeeze(0) if len(output_tensor.shape) == 3 else output_tensor
 
 
+@MM_WEIGHT_REGISTER("int8-convrot")
+class MMWeightWint8ConvRot(MMWeightQuantTemplate):
+    """ConvRot W8A8 linear backed by comfy-kitchen."""
+
+    supported_groupsizes = (256, 64, 16)
+
+    def __init__(
+        self,
+        weight_name,
+        bias_name,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+        if comfy_kitchen is None or not hasattr(comfy_kitchen, "int8_linear"):
+            raise ImportError("int8-convrot requires comfy-kitchen with int8_linear support. Install or upgrade it with `pip install -U comfy-kitchen`.")
+        self.weight_need_transpose = False
+        self.scale_force_fp32 = True
+
+    def _update_base_attrs(self):
+        super()._update_base_attrs()
+        self.convrot_groupsize_name = self.weight_name.removesuffix(".weight") + ".convrot_groupsize"
+        self.base_attrs.append((self.convrot_groupsize_name, "convrot_groupsize", False))
+
+    def load_quantized(self, weight_dict):
+        if not self.create_cuda_buffer and not self.create_cpu_buffer and not self.lazy_load:
+            device_tensors, pin_tensors = create_default_tensors(self.base_attrs, weight_dict)
+            for attr, tensor in device_tensors.items():
+                setattr(self, attr, tensor)
+            for attr, tensor in pin_tensors.items():
+                setattr(self, f"pin_{attr}", tensor)
+        elif self.create_cuda_buffer:
+            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file, scale_force_fp32=self.scale_force_fp32, bias_force_fp32=self.bias_force_fp32)
+            for attr, tensor in result.items():
+                setattr(self, f"{attr}_cuda_buffer", tensor)
+        elif self.create_cpu_buffer:
+            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file, scale_force_fp32=self.scale_force_fp32, bias_force_fp32=self.bias_force_fp32)
+            for attr, tensor in result.items():
+                setattr(self, f"pin_{attr}", tensor)
+                setattr(self, attr, None)
+
+    def _cache_convrot_groupsize(self):
+        groupsize = getattr(self, "convrot_groupsize", None)
+        if groupsize is None:
+            groupsize = getattr(self, "pin_convrot_groupsize", None)
+        if groupsize is None:
+            groupsize = getattr(self, "convrot_groupsize_cuda_buffer", None)
+        if groupsize is not None:
+            self._convrot_groupsize = int(groupsize.item())
+            if self._convrot_groupsize not in self.supported_groupsizes:
+                raise ValueError(f"Unsupported INT8 ConvRot group size {self._convrot_groupsize}; expected one of {self.supported_groupsizes}")
+
+    def post_process(self):
+        super().post_process()
+        self._cache_convrot_groupsize()
+
+    def load_state_dict(self, destination, block_index, adapter_block_index=None):
+        result = super().load_state_dict(destination, block_index, adapter_block_index)
+        if not hasattr(self, "_convrot_groupsize"):
+            self._cache_convrot_groupsize()
+        return result
+
+    def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
+        super().load_state_dict_from_disk(block_index, adapter_block_index)
+        self.convrot_groupsize_name = resolve_block_name(self.convrot_groupsize_name, block_index, adapter_block_index, self.is_post_adapter)
+        lazy_load_file_path = get_lazy_load_file_path(self.lazy_load_file, self.weight_name)
+        with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
+            self.pin_convrot_groupsize.copy_(lazy_load_file.get_tensor(self.convrot_groupsize_name))
+        if not hasattr(self, "_convrot_groupsize"):
+            self._cache_convrot_groupsize()
+
+    def apply(self, input_tensor):
+        if input_tensor.shape[-1] % self._convrot_groupsize != 0:
+            raise ValueError(f"INT8 ConvRot requires input width divisible by {self._convrot_groupsize}, got {input_tensor.shape[-1]}")
+
+        output_tensor = _int8_convrot_linear(
+            input_tensor.contiguous(),
+            self.weight.contiguous(),
+            self.weight_scale.contiguous(),
+            self._get_actual_bias(),
+            self.infer_dtype,
+            self._convrot_groupsize,
+        )
+        if self.has_lora_branch:
+            output_tensor = output_tensor + self.apply_lora(input_tensor)
+        return output_tensor
+
+
 @MM_WEIGHT_REGISTER("fp8-b128-deepgemm")
 class MMWeightWfp8block128Afp8channelgroup128dynamicDeepgemmActSgl(MMWeightQuantTemplate):
     """
@@ -1780,13 +1988,50 @@ class MMWeightWfp8channelAfp8channeldynamicSgl(MMWeightQuantTemplate):
 
     def apply(self, input_tensor):
         input_tensor_quant, input_tensor_scale = self.act_quant_func(input_tensor)
-        output_tensor = sgl_kernel.fp8_scaled_mm(
-            input_tensor_quant,
+        if magi_register_custom_op is not None and sgl_kernel is not None:
+            output_tensor = torch.ops.lightx2v.fp8_scaled_mm(
+                input_tensor_quant,
+                self.weight,
+                input_tensor_scale,
+                self.weight_scale,
+                self.infer_dtype,
+                self._get_actual_bias(),
+            )
+        else:
+            output_tensor = sgl_fp8_scaled_mm(
+                input_tensor_quant,
+                self.weight,
+                input_tensor_scale,
+                self.weight_scale,
+                self.infer_dtype,
+                self._get_actual_bias(),
+            )
+        if self.has_lora_branch:
+            return output_tensor + self.apply_lora(input_tensor)
+        return output_tensor
+
+
+@MM_WEIGHT_REGISTER("fp8-f16-accum")
+class MMWeightWfp8channelAfp8channelF16Accum(MMWeightWfp8channelAfp8channeldynamicSgl):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fp8_activation_qmax = None
+
+    def enable_fp8_f16_accum(self, activation_qmax):
+        activation_qmax = validate_fp8_f16_accum_qmax(activation_qmax)
+        if fp8_f16_accum_mm_available():
+            self.fp8_activation_qmax = activation_qmax
+
+    def apply(self, input_tensor):
+        if self.fp8_activation_qmax is None:
+            return super().apply(input_tensor)
+
+        output_tensor = fp8_f16_accum_linear(
+            input_tensor,
             self.weight,
-            input_tensor_scale,
             self.weight_scale,
-            self.infer_dtype,
             self._get_actual_bias(),
+            self.fp8_activation_qmax,
         )
         if self.has_lora_branch:
             return output_tensor + self.apply_lora(input_tensor)
@@ -2350,17 +2595,15 @@ class MMWeightWfp8tensorAfp8tensordynamic(MMWeightQuantTemplate):
         if bias is not None and bias.dtype != mm_dtype:
             bias = bias.to(mm_dtype)
         input_tensor_quant = self.act_quant_func(input_tensor)
-        # weight_scale shape: () / (1,) for per-tensor, (1, N) for
-        # per-output-channel. ``torch._scaled_mm`` wants scale_b shape
-        # (1, 1) for per-tensor or (1, N) for per-channel — and when
-        # *either* scale is 2D (RowWise/ColWise scaling), both must be 2D.
+        # Inductor requires matching scale ranks: (1,) per tensor or
+        # (1, N) per output channel.
         ws = self.weight_scale
         if ws.dim() == 2:
             scale_b = ws
             scale_a = self.input_scale.reshape(1, 1)
         else:
             scale_b = ws.reshape(1)
-            scale_a = self.input_scale
+            scale_a = self.input_scale.reshape(1)
         output_tensor = torch._scaled_mm(
             input_tensor_quant,
             self.weight,
@@ -2408,6 +2651,8 @@ class MMWeightTP(MMWeightTemplate):
         is_post_adapter=False,
         lora_prefix="diffusion_model.blocks",
         lora_path="",
+        reduce_output=True,
+        lora_column_chunks=1,
     ):
         super().__init__(
             weight_name,
@@ -2424,7 +2669,10 @@ class MMWeightTP(MMWeightTemplate):
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.split_dim = split_dim  # "col" for column split, "row" for row split
+        self.reduce_output = reduce_output
+        self.lora_column_chunks = lora_column_chunks
         assert split_dim in ["col", "row"], f"split_dim must be 'col' or 'row', got {split_dim}"
+        assert lora_column_chunks >= 1, f"lora_column_chunks must be positive, got {lora_column_chunks}"
 
         self._mm = MM_WEIGHT_REGISTER.get(mm_type, MMWeight)(
             weight_name=weight_name,
@@ -2439,6 +2687,58 @@ class MMWeightTP(MMWeightTemplate):
         )
         self._row_split_bias = None
 
+    def _local_lora_weights(self, weight_dict):
+        down_name = self._mm.lora_down_name
+        if down_name not in weight_dict:
+            return {}
+
+        up_name = self._mm.lora_up_name
+        if up_name not in weight_dict:
+            raise KeyError(f"LoRA is missing the up tensor paired with {down_name}")
+
+        lora_down = weight_dict[down_name]
+        lora_up = weight_dict[up_name]
+        if self.tp_size > 1:
+            if self.split_dim == "row":
+                if lora_down.shape[1] % self.tp_size:
+                    raise ValueError(f"Cannot row-shard {down_name} shape {tuple(lora_down.shape)} across TP size {self.tp_size}")
+                lora_down = torch.chunk(lora_down, self.tp_size, dim=1)[self.tp_rank].contiguous()
+            else:
+                if lora_up.shape[0] % self.lora_column_chunks:
+                    raise ValueError(f"Cannot split {up_name} shape {tuple(lora_up.shape)} into {self.lora_column_chunks} fused chunks")
+                chunks = lora_up.chunk(self.lora_column_chunks, dim=0)
+                if chunks[0].shape[0] % self.tp_size:
+                    raise ValueError(f"Cannot column-shard {up_name} shape {tuple(lora_up.shape)} across TP size {self.tp_size}")
+                lora_up = torch.cat([torch.chunk(chunk, self.tp_size, dim=0)[self.tp_rank] for chunk in chunks], dim=0).contiguous()
+
+        local_weights = {down_name: lora_down, up_name: lora_up}
+        alpha_name = self._mm.lora_alpha_name
+        if alpha_name in weight_dict:
+            local_weights[alpha_name] = weight_dict[alpha_name]
+        return local_weights
+
+    def register_lora(self, weight_dict, lora_strength=1):
+        self._mm.register_lora(self._local_lora_weights(weight_dict), lora_strength)
+
+    def update_lora(self, weight_dict, lora_strength=1):
+        self._mm.update_lora(self._local_lora_weights(weight_dict), lora_strength)
+
+    def remove_lora(self):
+        self._mm.remove_lora()
+
+    def set_config(self, config=None):
+        config = {} if config is None else config
+        self.config = config
+        self._mm.set_config(config)
+
+    def _extract_row_split_bias(self, clone=False):
+        if self.split_dim != "row":
+            return
+        bias = getattr(self._mm, "bias", None)
+        if bias is not None:
+            self._row_split_bias = bias.clone() if clone else bias
+            self._mm.bias = None
+
     def load(self, weight_dict):
         """Load weights using internal MMWeight's load method.
 
@@ -2451,8 +2751,34 @@ class MMWeightTP(MMWeightTemplate):
         """
         self._mm.load(weight_dict)
         if self.split_dim == "row" and self.bias_name is not None and self.bias_name in weight_dict:
-            self._row_split_bias = self._mm.bias.clone()
-            self._mm.bias = None
+            # Preserve the original resident-weight behavior. Buffer-only
+            # modules do not have a materialized bias yet and are handled when
+            # load_state_dict fills the buffer.
+            self._extract_row_split_bias(clone=True)
+
+    def state_dict(self, destination=None):
+        return self._mm.state_dict(destination)
+
+    def load_state_dict(self, destination, block_index, adapter_block_index=None):
+        result = self._mm.load_state_dict(destination, block_index, adapter_block_index)
+        self._extract_row_split_bias()
+        return result
+
+    def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
+        result = self._mm.load_state_dict_from_disk(block_index, adapter_block_index)
+        self._extract_row_split_bias()
+        return result
+
+    def to_cuda(self, non_blocking=False):
+        result = self._mm.to_cuda(non_blocking)
+        self._extract_row_split_bias()
+        return result
+
+    def to_cpu(self, non_blocking=False):
+        if self._row_split_bias is not None:
+            self._mm.bias = self._row_split_bias
+            self._row_split_bias = None
+        return self._mm.to_cpu(non_blocking)
 
     def apply(self, input_tensor):
         """Apply matrix multiplication with tensor parallel support."""
@@ -2461,7 +2787,7 @@ class MMWeightTP(MMWeightTemplate):
         output = self._mm.apply(input_tensor)
 
         # For row split, need all-reduce to combine results from all ranks
-        if self.split_dim == "row" and self.tp_size > 1 and self.tp_group is not None:
+        if self.split_dim == "row" and self.reduce_output and self.tp_size > 1 and self.tp_group is not None:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
             # Add bias after all-reduce (bias is not split for row split)
             if self._row_split_bias is not None:
@@ -2470,62 +2796,6 @@ class MMWeightTP(MMWeightTemplate):
         return output
 
 
-@MM_WEIGHT_REGISTER("fp8-intel-xpu")
-class MMWeightFp8IntelXpu(MMWeightQuantTemplate):
-    """
-    Name: W-fp8-channel-sym-A-fp16-Intel-XPU
-
-    Intel XPU optimized FP8 kernel:
-        Weight Storage: fp8 (torch.float8_e4m3fn) - saves 50% memory
-        Computation: fp16 using PyTorch native ops
-        - Dynamically dequantize FP8 → FP16 during forward
-        - Use torch.nn.functional.linear (compatible with Intel XPU)
-
-    Benefits:
-        - Memory efficient: FP8 storage (8-bit)
-        - Compatible: FP16 compute using PyTorch native ops
-        - Intel XPU friendly: No CUDA-specific kernels
-
-    Usage in config:
-        {
-            "dit_quant_scheme": "fp8-intel-xpu",
-            "weight_auto_quant": true,
-            "dit_quantized": true
-        }
-    """
-
-    def __init__(self, weight_name, bias_name, create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_file=None, is_post_adapter=False, lora_prefix=None, lora_path=""):
-        super().__init__(weight_name, bias_name, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_file, is_post_adapter, lora_prefix, lora_path)
-
-        self.load_func = self.load_fp8_perchannel_sym
-        self.weight_need_transpose = False  # We'll handle transpose in apply
-
-    def apply(self, input_tensor):
-        # # """
-        # Forward pass with FP8 → FP16 dequantization
-
-        # Steps:
-        # 1. Dequantize weight: fp8 → fp16 (weight * scale)
-        # 2. Compute: torch.nn.functional.linear(input_fp16, weight_fp16, bias)
-        # """
-        # # Ensure input is FP16
-        # # print(input_tensor.dtype)
-
-        if sycl_kernels is not None:
-            try:
-                return sycl_kernels.onednn_w8a16_fp8(input_tensor, self.weight, self.weight_scale.to(torch.float))
-            except RuntimeError:
-                pass  # Fall through to torch dequantization path
-
-        infer_dtype = self.infer_dtype
-        squeeze_output = False
-        if input_tensor.dim() == 3 and input_tensor.shape[0] == 1:
-            input_tensor = input_tensor.squeeze(0)
-            squeeze_output = True
-        input_tensor = input_tensor.to(infer_dtype)
-        weight_fp16 = self.weight.to(infer_dtype) * self.weight_scale.to(infer_dtype)
-        bias_fp16 = self.bias.to(infer_dtype) if hasattr(self, "bias") and self.bias is not None else None
-        output = torch.nn.functional.linear(input_tensor, weight_fp16, bias_fp16)
-        if squeeze_output:
-            output = output.unsqueeze(0)
-        return output
+def unwrap_tp_weight(module):
+    """Return the concrete tensor-owning MM implementation from a TP wrapper."""
+    return module._mm if isinstance(module, MMWeightTP) else module

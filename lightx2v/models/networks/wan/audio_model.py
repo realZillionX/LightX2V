@@ -6,12 +6,13 @@ import torch.nn.functional as F
 from loguru import logger
 
 from lightx2v.models.networks.wan.infer.audio.post_infer import WanAudioPostInfer
-from lightx2v.models.networks.wan.infer.audio.pre_infer import WanAudioPreInfer
-from lightx2v.models.networks.wan.infer.audio.transformer_infer import WanAudioTransformerInfer
+from lightx2v.models.networks.wan.infer.audio.pre_infer import WanAudioARPreInfer, WanAudioPreInfer
+from lightx2v.models.networks.wan.infer.audio.transformer_infer import WanAudioARTransformerInfer, WanAudioTransformerInfer
 from lightx2v.models.networks.wan.model import WanModel
 from lightx2v.models.networks.wan.weights.audio.transformer_weights import WanAudioTransformerWeights
 from lightx2v.models.networks.wan.weights.post_weights import WanPostWeights
 from lightx2v.models.networks.wan.weights.pre_weights import WanPreWeights
+from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import load_weights
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -29,7 +30,7 @@ class WanAudioModel(WanModel):
             if self.config.get("adapter_quantized", False):
                 if self.config.get("adapter_quant_scheme", None) in ["fp8", "fp8-q8f", "fp8-vllm", "fp8-sgl", "fp8-torchao", "fp8-triton"]:
                     adapter_model_name = "audio_adapter_model_fp8.safetensors"
-                elif self.config.get("adapter_quant_scheme", None) in ["int8", "int8-q8f", "int8-vllm", "int8-torchao", "int8-sgl", "int8-triton", "int8-tmo", "int8-npu"]:
+                elif self.config.get("adapter_quant_scheme", None) in ["int8", "int8-q8f", "int8-vllm", "int8-torchao", "int8-sgl", "int8-triton", "int8-tmo", "int8-npu", "int8-iluvatar"]:
                     adapter_model_name = "audio_adapter_model_int8.safetensors"
                 elif self.config.get("adapter_quant_scheme", None) in ["mxfp4"]:
                     adapter_model_name = "audio_adapter_model_mxfp4.safetensors"
@@ -50,7 +51,6 @@ class WanAudioModel(WanModel):
             logger.info(f"[DummyModel] Generating random adapter weights on device={dummy_device}")
             tensors_meta = BaseTransformerModel._read_safetensors_metadata(self.config["adapter_model_path"])
             adapter_weights_dict = {}
-            from lightx2v.utils.envs import GET_DTYPE
 
             for key, meta in tensors_meta.items():
                 if "audio" in key:
@@ -66,10 +66,10 @@ class WanAudioModel(WanModel):
         adapter_offload = self.config.get("cpu_offload", False)
         load_from_rank0 = self.config.get("load_from_rank0", False)
         adapter_weights_dict = load_weights(self.config["adapter_model_path"], cpu_offload=adapter_offload, remove_key="audio", load_from_rank0=load_from_rank0)
-        if not adapter_offload:
-            if not dist.is_initialized() or not load_from_rank0:
-                for key in adapter_weights_dict:
-                    adapter_weights_dict[key] = adapter_weights_dict[key].to(torch.device(AI_DEVICE))
+        target_device = torch.device("cpu") if adapter_offload else torch.device(AI_DEVICE)
+        target_dtype = GET_DTYPE()
+        for key, tensor in adapter_weights_dict.items():
+            adapter_weights_dict[key] = tensor.to(device=target_device, dtype=target_dtype) if (tensor.is_floating_point() and tensor.dtype != torch.float8_e4m3fn) else tensor.to(device=target_device)
         return adapter_weights_dict
 
     def _init_infer_class(self):
@@ -77,82 +77,6 @@ class WanAudioModel(WanModel):
         self.pre_infer_class = WanAudioPreInfer
         self.post_infer_class = WanAudioPostInfer
         self.transformer_infer_class = WanAudioTransformerInfer
-
-    def get_graph_name(self, shape, audio_num, with_mask=True):
-        return f"graph_{shape[0]}x{shape[1]}_audio_num_{audio_num}_mask_{with_mask}"
-
-    def start_compile(self, shape, audio_num, with_mask=True):
-        graph_name = self.get_graph_name(shape, audio_num, with_mask)
-        logger.info(f"[Compile] Compile shape: {shape}, audio_num:{audio_num}, graph_name: {graph_name}")
-
-        target_video_length = self.config.get("target_video_length", 81)
-        latents_length = (target_video_length - 1) // 16 * 4 + 1
-        latents_h = shape[0] // self.config["vae_stride"][1]
-        latents_w = shape[1] // self.config["vae_stride"][2]
-
-        new_inputs = {}
-        new_inputs["text_encoder_output"] = {}
-        new_inputs["text_encoder_output"]["context"] = torch.randn(1, 512, 4096, dtype=torch.bfloat16).cuda()
-        new_inputs["text_encoder_output"]["context_null"] = torch.randn(1, 512, 4096, dtype=torch.bfloat16).cuda()
-
-        new_inputs["image_encoder_output"] = {}
-        new_inputs["image_encoder_output"]["clip_encoder_out"] = torch.randn(257, 1280, dtype=torch.bfloat16).cuda()
-        new_inputs["image_encoder_output"]["vae_encoder_out"] = torch.randn(16, 1, latents_h, latents_w, dtype=torch.bfloat16).cuda()
-
-        new_inputs["audio_encoder_output"] = torch.randn(audio_num, latents_length, 128, 1024, dtype=torch.bfloat16).cuda()
-        if with_mask:
-            new_inputs["person_mask_latens"] = torch.zeros(audio_num, 1, (latents_h // 2), (latents_w // 2), dtype=torch.int8).cuda()
-        else:
-            assert audio_num == 1, "audio_num must be 1 when with_mask is False"
-            new_inputs["person_mask_latens"] = None
-
-        new_inputs["previmg_encoder_output"] = {}
-        new_inputs["previmg_encoder_output"]["prev_latents"] = torch.randn(16, latents_length, latents_h, latents_w, dtype=torch.bfloat16).cuda()
-        new_inputs["previmg_encoder_output"]["prev_mask"] = torch.randn(4, latents_length, latents_h, latents_w, dtype=torch.bfloat16).cuda()
-
-        self.scheduler.latents = torch.randn(16, latents_length, latents_h, latents_w, dtype=torch.bfloat16).cuda()
-        self.scheduler.timestep_input = torch.tensor([600.0], dtype=torch.float32).cuda()
-        self.scheduler.audio_adapter_t_emb = torch.randn(1, 3, 5120, dtype=torch.bfloat16).cuda()
-
-        self._infer_cond_uncond(new_inputs, infer_condition=True, graph_name=graph_name)
-
-    def compile(self, compile_shapes):
-        self.check_compile_shapes(compile_shapes)
-        self.enable_compile_mode("_infer_cond_uncond")
-
-        if self.cpu_offload:
-            if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:
-                self.to_cuda()
-            elif self.offload_granularity != "model":
-                self.pre_weight.to_cuda()
-                self.transformer_weights.non_block_weights_to_cuda()
-
-        max_audio_num_num = self.config.get("compile_max_audios", 1)
-        for audio_num in range(1, max_audio_num_num + 1):
-            for shape in compile_shapes:
-                self.start_compile(shape, audio_num, with_mask=True)
-                if audio_num == 1:
-                    self.start_compile(shape, audio_num, with_mask=False)
-
-        if self.cpu_offload:
-            if self.offload_granularity == "model" and self.scheduler.step_index == self.scheduler.infer_steps - 1 and "wan2.2_moe" not in self.config["model_cls"]:
-                self.to_cpu()
-            elif self.offload_granularity != "model":
-                self.pre_weight.to_cpu()
-                self.transformer_weights.non_block_weights_to_cpu()
-
-        self.disable_compile_mode("_infer_cond_uncond")
-        logger.info(f"[Compile] Compile status: {self.get_compile_status()}")
-
-    def check_compile_shapes(self, compile_shapes):
-        for shape in compile_shapes:
-            assert shape in [[480, 832], [544, 960], [720, 1280], [832, 480], [960, 544], [1280, 720], [480, 480], [576, 576], [704, 704], [960, 960]]
-
-    def select_graph_for_compile(self, input_info):
-        logger.info(f"target_h, target_w : {input_info.target_shape[0]}, {input_info.target_shape[1]}, audio_num: {input_info.audio_num}")
-        graph_name = self.get_graph_name(input_info.target_shape, input_info.audio_num, with_mask=input_info.with_mask)
-        self.select_graph("_infer_cond_uncond", graph_name)
-        logger.info(f"[Compile] Compile status: {self.get_compile_status()}")
 
     @torch.no_grad()
     def _seq_parallel_pre_process(self, pre_infer_out):
@@ -172,12 +96,43 @@ class WanAudioModel(WanModel):
         if person_mask_latens is not None:
             pre_infer_out.adapter_args["person_mask_latens"] = torch.chunk(person_mask_latens, world_size, dim=1)[cur_rank]
 
-        if self.config["model_cls"] in ["wan2.2", "wan2.2_audio"] and self.config["task"] in ["i2v", "s2v", "rs2v"]:
-            embed, embed0 = pre_infer_out.embed, pre_infer_out.embed0
-            padding_size = (world_size - (embed.shape[0] % world_size)) % world_size
-            if padding_size > 0:
-                embed = F.pad(embed, (0, 0, 0, padding_size))
-                embed0 = F.pad(embed0, (0, 0, 0, 0, 0, padding_size))
-            pre_infer_out.embed = torch.chunk(embed, world_size, dim=0)[cur_rank]
-            pre_infer_out.embed0 = torch.chunk(embed0, world_size, dim=0)[cur_rank]
         return pre_infer_out
+
+
+class WanAudioARModel(WanAudioModel):
+    def _init_infer_class(self):
+        super()._init_infer_class()
+        self.pre_infer_class = WanAudioARPreInfer
+        self.post_infer_class = WanAudioPostInfer
+        self.transformer_infer_class = WanAudioARTransformerInfer
+
+    @torch.no_grad()
+    def infer(self, inputs):
+        if self.cpu_offload:
+            if self.offload_granularity == "model" and self.scheduler.step_index == 0:
+                self.to_cuda()
+            elif self.offload_granularity != "model":
+                self.pre_weight.to_cuda()
+                self.transformer_weights.non_block_weights_to_cuda()
+
+        pre_infer_out = self.pre_infer.infer(self.pre_weight, inputs)
+        if self.config["seq_parallel"] and not inputs.get("_ar_ref_prefill", False):
+            pre_infer_out = self._seq_parallel_pre_process(pre_infer_out)
+
+        x = self.transformer_infer.infer(self.transformer_weights, pre_infer_out)
+
+        if inputs.get("_ar_ref_prefill", False):
+            noise_pred = None
+        else:
+            if self.config["seq_parallel"]:
+                x = self._seq_parallel_post_process(x)
+            noise_pred = self.post_infer.infer(x, pre_infer_out)[0]
+            self.scheduler.noise_pred = noise_pred
+
+        if self.cpu_offload:
+            if self.offload_granularity == "model" and self.scheduler.step_index == self.scheduler.infer_steps - 1:
+                self.to_cpu()
+            elif self.offload_granularity != "model":
+                self.pre_weight.to_cpu()
+                self.transformer_weights.non_block_weights_to_cpu()
+        return noise_pred

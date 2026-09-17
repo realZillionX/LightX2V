@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -40,8 +41,43 @@ limitations under the License.
 
 
 /*
+ * From csrc/conv
+ */
+torch::Tensor fp8_conv3d_f16_accum_sm120(
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    int64_t stride_d,
+    int64_t stride_h,
+    int64_t stride_w);
+
+torch::Tensor fp8_conv3d_f32_accum_sm120(
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    int64_t stride_d,
+    int64_t stride_h,
+    int64_t stride_w);
+
+/*
  * From csrc/gemm
  */
+torch::Tensor cutlass_scaled_fp8_mm_f16_accum_sm120(
+    torch::Tensor activation,
+    torch::Tensor weight,
+    torch::Tensor activation_scale,
+    torch::Tensor weight_scale,
+    torch::ScalarType out_dtype,
+    c10::optional<torch::Tensor> const& bias = c10::nullopt);
+
+torch::Tensor cutlass_scaled_fp8_mm_f16_accum_with_config_sm120(
+    torch::Tensor activation,
+    torch::Tensor weight,
+    torch::Tensor activation_scale,
+    torch::Tensor weight_scale,
+    torch::ScalarType out_dtype,
+    c10::optional<torch::Tensor> const& bias,
+    int64_t config_id);
+
+
 void scaled_nvfp4_quant_sm120(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf);
 
@@ -53,6 +89,16 @@ void scaled_mxfp6_quant_sm120(
 
 void scaled_mxfp8_quant_sm120(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf);
+
+void scaled_mxfp8_gelu_quant_sm120(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf);
+
+void scaled_mxfp8_modulate_quant_sm120(
+    torch::Tensor& output,
+    torch::Tensor const& input,
+    torch::Tensor const& scale,
+    torch::Tensor const& shift,
+    torch::Tensor& output_sf);
 
 void cutlass_scaled_nvfp4_mm_sm120(
     torch::Tensor& D,
@@ -90,3 +136,23 @@ void cutlass_scaled_mxfp8_mm_sm120(
     torch::Tensor const& B_sf,
     torch::Tensor const& alpha,
     c10::optional<torch::Tensor> const& bias);
+
+void cutlass_scaled_mxfp8_mm_residual_gate_sm120(
+    torch::Tensor& residual,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias,
+    torch::Tensor const& gate);
+
+at::Tensor dequantize_kv_cache_fp4_cuda(
+    at::TensorList values,
+    at::TensorList scale_factors,
+    at::TensorList amax,
+    int64_t num_heads,
+    int64_t block_token_size,
+    int64_t dtype_code,
+    double e2m1_max,
+    double e4m3_max);

@@ -3,7 +3,19 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from lightx2v.models.networks.neopp.infer.transformer_infer import NeoppTransformerInfer
+import ast
+from pathlib import Path
+
+# The decoder math needs Torch, but does not need the CUDA attention/MoE imports.
+source = Path(__file__).resolve().parents[2] / "lightx2v/models/networks/neopp/infer/transformer_infer.py"
+cls = next(node for node in ast.parse(source.read_text()).body
+           if isinstance(node, ast.ClassDef) and node.name == "NeoppTransformerInfer")
+cls.bases = []
+cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef)
+            and node.name in {"_fm_head", "_fm_head_pixel", "_patchify_pixels"}]
+namespace = {"F": F, "torch": torch}
+exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
+NeoppTransformerInfer = namespace["NeoppTransformerInfer"]
 
 
 class _Conv:
@@ -39,9 +51,8 @@ def test_u15_pixel_head_matches_conv_decoder_and_patchify():
     infer.scheduler = SimpleNamespace(
         image_prediction=torch.zeros(1, 3, token_h * output_patch_size, token_w * output_patch_size)
     )
-    pre_infer = SimpleNamespace(image_token_num=token_h * token_w)
 
-    actual = infer._fm_head(weights, hidden, pre_infer)
+    actual = infer._fm_head(weights, hidden, token_h, token_w)
 
     image = hidden.reshape(1, token_h, token_w, hidden_size).permute(0, 3, 1, 2).contiguous()
     image = F.pixel_shuffle(image, 2)

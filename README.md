@@ -7,7 +7,6 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ModelTC/lightx2v)
 [![Doc](https://img.shields.io/badge/docs-English-99cc2)](https://lightx2v-en.readthedocs.io/en/latest)
 [![Doc](https://img.shields.io/badge/文档-中文-99cc2)](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest)
-[![Papers](https://img.shields.io/badge/论文集-中文-99cc2)](https://lightx2v-papers-zhcn.readthedocs.io/zh-cn/latest)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/lightx2v/lightx2v/tags)
 
 **\[ English | [中文](README_zh.md) \]**
@@ -18,11 +17,15 @@
 
 **LightX2V** is an advanced lightweight image/video generation inference framework engineered to deliver efficient, high-performance image/video synthesis solutions. This unified platform integrates multiple state-of-the-art image/video generation techniques, supporting diverse generation tasks including text-to-video (T2V), image-to-video (I2V), text-to-image (T2I), image-editing (I2I). **X2V represents the transformation of different input modalities (X, such as text or images) into vision output (Vision)**.
 
-> 🌐 **Try it online now!** Experience LightX2V without installation: **[LightX2V Online Service](https://x2v.light-ai.top/login)** - Free, lightweight, and fast AI digital human video generation platform.
+> 🌐 **Try it online now!** Experience LightX2V without installation: **[LightX2V Studio](https://x2v.light-ai.top/)** — a free, lightweight AI video platform with **Minimax H3**, **Wan 2.2**, **SekoTalk**, **Qwen-Image**, **SwiftVR**, and more models and tasks.
 
-> 👋 **Join our WeChat group! LightX2V Rotbot WeChat ID: random42seed**
+> 🤗 **HuggingFace Model Repository: [LightX2V HuggingFace](https://huggingface.co/lightx2v)**
 
-> 🌐 More content is available on our [LightX2V Blog](https://light-ai.top/LightX2V-BLOG/)
+> 📝 **More content is available on our [LightX2V Blog](https://light-ai.top/LightX2V-BLOG/)**
+
+> 🌟 **Developer Newbie Guide: [LightX2V Developer Quick Start Guide](https://github.com/ModelTC/LightX2V/tree/main/examples/BeginnerGuide)**
+
+> 👋 **Join our WeChat group! LightX2V Robot WeChat ID: random42seed**
 
 ## 🧾 Community Code Contribution Guidelines
 
@@ -42,8 +45,29 @@ Besides the contributions from the LightX2V team, we have received contributions
 - [kikidouloveme79](https://github.com/kikidouloveme79)
 - [ziyanxzy](https://github.com/ziyanxzy)
 - [Tyr0727](https://github.com/Tyr0727)
+- [hufangjian2017](https://github.com/hufangjian2017)
+- [Fatemanx](https://github.com/Fatemanx)
+- [qiuxin2012](https://github.com/qiuxin2012)
 
 ## :fire: Latest News
+
+- **August 27, 2026:** 🚀 We release the [MiniMax-H3 Turbo 8-step v1.0 768p distilled LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/main/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors) for fast 768p audio-video generation with MiniMax-H3, delivering improved video and audio quality.
+
+- **August 11, 2026:** 🚀 We release and support the [MiniMax-H3 Turbo 4-step v1.0 768p distilled LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/main/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors). The released DMD configs under `configs/minimax_h3/dmd` run H3 at 1344x768 with `video_flow_shift=6`, `audio_flow_shift=3`, LoRA alpha 128, and 4-step guidance-free inference.
+
+- **August 7, 2026:** 🚀 LightX2V introduces comprehensive inference support for [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), an omni-modal generative model that produces video with native synchronized stereo audio. The integration covers T2AV, I2AV, L2AV, FL2AV, and Ref2AV workflows, and incorporates model- and block-level offloading, tensor and sequence parallelism, quantized DiT inference, and feature caching. Single- and multi-GPU examples are available in the [MiniMax-H3 inference scripts](scripts/minimax_h3). Alongside this integration, we release the [MiniMax-H3 T2VA Prompt Rewriter LoRA](https://huggingface.co/lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA), fine-tuned from Qwen3.6-27B to transform concise user prompts into structured, H3-oriented multimodal descriptions spanning visual narrative, soundscape, and non-diegetic music.
+
+- **July 28, 2026:** 🚀 We release the [LightLingBot-Video](https://huggingface.co/lightx2v/LightLingBot-Video) 4-step distilled LoRA for LingBot-Video. It supports T2V, T2I, and I2V generation in only 4 inference steps without CFG. See the [LingBot-Video inference scripts](scripts/lingbot_video) for usage.
+
+- **July 23, 2026:** ⚡️ We release the blog: [LightX2V ROS: Closing the Loop for Action-Generating World Models](https://light-ai.top/LightX2V-BLOG/posts/LightX2V_ROS/)
+
+- **July 19, 2026:** ⚡️ We release the blog: [Wan2.2-NVFP4-Sparse: Extremely Fast Wan 2.2 14B Inference](https://light-ai.top/LightX2V-BLOG/posts/Wan22-NVFP4-Sparse/)
+
+- **June 15, 2026:** 🚀 Supported deployment on T-head PPU.
+
+- **May 29, 2026:** 🚀 We introduce an extremely efficient Wan 2.2 14B variant (T2V and I2V): [NVFP4 Quantization-Aware Step Distillation with Sparse Attention for Blackwell Architecture](https://huggingface.co/lightx2v/Wan2.2-NVFP4-Sparse). On a single RTX 5090 GPU, it achieves over 50× speedup.
+
+- **April 30, 2026:** 🚀 We now support deployment on iluvatar. Thanks to the iluvatar team.
 
 - **April 20, 2026:** 🚀 We are excited to release the [Wan2.2-I2V-A14B-4step-720p-high](https://huggingface.co/lightx2v/Wan2.2-Distill-Models/blob/main/wan2.2_i2v_A14b_high_noise_lightx2v_4step_720p_260412.safetensors) and [Wan2.2-I2V-A14B-4step-720p-low](https://huggingface.co/lightx2v/Wan2.2-Distill-Models/blob/main/wan2.2_i2v_A14b_low_noise_lightx2v_4step_720p_260412.safetensors) models. Compared to previous iterations, this version was trained on a high-quality 720p dataset and features an optimized low-noise training algorithm. These enhancements significantly boost the model's performance in fine-grained detail rendering and visual texture.
 
@@ -152,62 +176,39 @@ For attention operators installation, please refer to our documentation: **[Engl
 
 ### Usage Example
 
+See the [MiniMax-H3 guide](scripts/minimax_h3/README.md) for checkpoint layout, local LoRA paths, CLI presets, and server/POST examples.
+
 ```python
-# examples/wan/wan_i2v.py
+# examples/minimax_h3/minimax_h3_t2av_dmd.py
 """
-Wan2.2 image-to-video generation example.
-This example demonstrates how to use LightX2V with Wan2.2 model for I2V generation.
+MiniMax-H3 T2AV generation with the 4-step 768p distilled LoRA.
 """
 
 from lightx2v import LightX2VPipeline
 
-# Initialize pipeline for Wan2.2 I2V task
-# For wan2.1, use model_cls="wan2.1"
+# Initialize the MiniMax-H3 T2AV pipeline.
 pipe = LightX2VPipeline(
-    model_path="/path/to/Wan2.2-I2V-A14B",
-    model_cls="wan2.2_moe",
-    task="i2v",
+    model_path="/path/to/MiniMax-H3",
+    model_cls="minimax_h3",
+    model_variant="fl2av",
 )
 
-# Alternative: create generator from config JSON file
-# pipe.create_generator(
-#     config_json="configs/wan22/wan_moe_i2v.json"
-# )
-
-# Enable offloading to significantly reduce VRAM usage with minimal speed impact
-# Suitable for RTX 30/40/50 consumer GPUs
-pipe.enable_offload(
-    cpu_offload=True,
-    offload_granularity="block",  # For Wan models, supports both "block" and "phase"
-    text_encoder_offload=True,
-    image_encoder_offload=False,
-    vae_offload=False,
-)
-
-# Create generator manually with specified parameters
+# The DMD config uses the released 768p LoRA, 4 inference steps,
+# video_flow_shift=6, audio_flow_shift=3, and lora alpha=128.
 pipe.create_generator(
-    attn_mode="sage_attn2",
-    infer_steps=40,
-    height=480,  # Can be set to 720 for higher resolution
-    width=832,  # Can be set to 1280 for higher resolution
-    num_frames=81,
-    guidance_scale=[3.5, 3.5],  # For wan2.1, guidance_scale is a scalar (e.g., 5.0)
-    sample_shift=5.0,
+    config_json="configs/minimax_h3/dmd/minimax_h3_bf16_4step.json"
 )
 
 # Generation parameters
 seed = 42
-prompt = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
-negative_prompt = "镜头晃动，色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-image_path="/path/to/img_0.jpg"
-save_result_path = "/path/to/save_results/output.mp4"
+prompt = "A cinematic fox walks through a snowy forest while soft wind and distant birds create an immersive winter soundscape."
+save_result_path = "outputs/minimax_h3_t2av_768p.mp4"
 
-# Generate video
+# Generate video with synchronized audio.
 pipe.generate(
+    task="t2av",
     seed=seed,
-    image_path=image_path,
     prompt=prompt,
-    negative_prompt=negative_prompt,
     save_result_path=save_result_path,
 )
 ```
@@ -223,15 +224,21 @@ pipe.generate(
 ## 🤖 Supported Model Ecosystem
 
 ### Official Open-Source Models
+- ✅ [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
+- ✅ [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)
 - ✅ [LTX-2](https://huggingface.co/Lightricks/LTX-2)
 - ✅ [HunyuanVideo-1.5](https://huggingface.co/tencent/HunyuanVideo-1.5)
 - ✅ [Wan2.1 & Wan2.2](https://huggingface.co/Wan-AI/)
+- ✅ [SeedVR2](https://huggingface.co/ByteDance-Seed/SeedVR2-3B)
+- ✅ [SwiftVR](https://huggingface.co/H-oliday/SwiftVR); convert the checkpoint with [convert_swiftvr.py](tools/convert/examples/convert_swiftvr.py), then run the [image or video SR scripts](scripts/swiftvr/inference).
 - ✅ [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image)
 - ✅ [Qwen-Image-Edit](https://huggingface.co/spaces/Qwen/Qwen-Image-Edit)
 - ✅ [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509)
 - ✅ [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
 
 ### Quantized and Distilled Models/LoRAs (**🚀 Recommended: 4-step inference**)
+- ✅ [MiniMax-H3 Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo) — 4-step 768p distilled LoRA for MiniMax-H3 T2AV/FL2AV
+- ✅ [LightLingBot-Video](https://huggingface.co/lightx2v/LightLingBot-Video) — 4-step distilled LoRA for LingBot-Video T2V, T2I, and I2V
 - ✅ [Wan2.1-Distill-Models](https://huggingface.co/lightx2v/Wan2.1-Distill-Models)
 - ✅ [Wan2.2-Distill-Models](https://huggingface.co/lightx2v/Wan2.2-Distill-Models)
 - ✅ [Wan2.1-Distill-Loras](https://huggingface.co/lightx2v/Wan2.1-Distill-Loras)
@@ -243,7 +250,6 @@ pipe.generate(
 - ✅ [Autoencoders](https://huggingface.co/lightx2v/Autoencoders)
 
 ### Autoregressive Models
-- ✅ [Wan2.1-T2V-CausVid](https://huggingface.co/lightx2v/Wan2.1-T2V-14B-CausVid)
 - ✅ [Self-Forcing](https://github.com/guandeh17/Self-Forcing)
 - ✅ [Matrix-Game-2.0](https://huggingface.co/Skywork/Matrix-Game-2.0)
 
@@ -284,7 +290,6 @@ We provide multiple frontend interface deployment options:
 - **🔄 Parallel Inference**: Multi-GPU parallel processing for enhanced performance
 - **📱 Flexible Deployment Options**: Support for Gradio, service deployment, ComfyUI and other deployment methods
 - **🎛️ Dynamic Resolution Inference**: Adaptive resolution adjustment for optimal generation quality
-- **🎞️ Video Frame Interpolation**: RIFE-based frame interpolation for smooth frame rate enhancement
 
 
 ## 📚 Technical Documentation
@@ -297,7 +302,6 @@ We provide multiple frontend interface deployment options:
 - [Parallel Inference](https://lightx2v-en.readthedocs.io/en/latest/method_tutorials/parallel.html) - Multi-GPU acceleration strategies
 - [Changing Resolution Inference](https://lightx2v-en.readthedocs.io/en/latest/method_tutorials/changing_resolution.html) - U-shaped resolution strategy
 - [Step Distillation](https://lightx2v-en.readthedocs.io/en/latest/method_tutorials/step_distill.html) - 4-step inference technology
-- [Video Frame Interpolation](https://lightx2v-en.readthedocs.io/en/latest/method_tutorials/video_frame_interpolation.html) - Base on the RIFE technology
 
 ### 🛠️ **Deployment Guides**
 - [Low-Resource Deployment](https://lightx2v-en.readthedocs.io/en/latest/deploy_guides/for_low_resource.html) - Optimized 8GB VRAM solutions
@@ -313,6 +317,7 @@ We sincerely thank all the model repositories and research communities that insp
 - [Tencent-Hunyuan](https://github.com/Tencent-Hunyuan)
 - [Wan-Video](https://github.com/Wan-Video)
 - [Qwen-Image](https://github.com/QwenLM/Qwen-Image)
+- [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
 - [LightLLM](https://github.com/ModelTC/LightLLM)
 - [sglang](https://github.com/sgl-project/sglang)
 - [vllm](https://github.com/vllm-project/vllm)
@@ -325,9 +330,11 @@ We sincerely thank all the model repositories and research communities that insp
 - [FastVideo](https://github.com/hao-ai-lab/FastVideo)
 - [Mooncake](https://github.com/kvcache-ai/Mooncake)
 
-## 🌟 Star History
+We also thank the cloud inference platforms supporting the wider ecosystem:
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ModelTC/lightx2v&type=Timeline)](https://star-history.com/#ModelTC/lightx2v&Timeline)
+- [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=lightx2v) — a full-modal AI inference platform whose hosted API serves the Wan / Seedance / Kling model families that LightX2V also supports, for teams that prefer a managed API over self-hosting.
+
+- [Sensecore](https://www.sensecore.cn/about) —— Sensecore. Build a high-efficiency, low-cost, and scalable AI cloud infrastructure, create a professional deep learning platform and algorithm model system, lead AI innovation, and help industry and academia explore the boundaries of AI.
 
 ## ✏️ Citation
 

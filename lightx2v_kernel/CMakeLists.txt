@@ -82,6 +82,8 @@ list(APPEND LIGHTX2V_KERNEL_CUDA_FLAGS
 
 
 set(SOURCES
+    "csrc/conv/fp8_conv3d_kernels_sm120.cu"
+    "csrc/gemm/fp8_f16_accum_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/nvfp4_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/nvfp4_quant_kernels_sm120.cu"
     "csrc/gemm/mxfp4_quant_kernels_sm120.cu"
@@ -90,6 +92,7 @@ set(SOURCES
     "csrc/gemm/mxfp4_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/mxfp6_mxfp8_scaled_mm_kernels_sm120.cu"
     "csrc/gemm/mxfp8_scaled_mm_kernels_sm120.cu"
+    "csrc/kvcache/kv_dequant_cuda.cu"
     "csrc/common_extension.cc"
 )
 

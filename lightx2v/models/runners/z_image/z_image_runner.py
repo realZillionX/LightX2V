@@ -1,5 +1,4 @@
 import gc
-import math
 
 import torch
 import torchvision.transforms.functional as TF
@@ -10,25 +9,17 @@ from lightx2v.models.input_encoders.hf.z_image.qwen3_model import Qwen3Model_Tex
 from lightx2v.models.networks.lora_adapter import LoraAdapter
 from lightx2v.models.networks.z_image.model import ZImageTransformerModel
 from lightx2v.models.runners.default_runner import DefaultRunner
+from lightx2v.models.runners.request_fields import IMAGE_REQUEST_FIELDS
 from lightx2v.models.schedulers.z_image.scheduler import ZImageScheduler
 from lightx2v.models.video_encoders.hf.z_image.vae import AutoencoderKLZImageVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
+from lightx2v.utils.utils import is_main_process
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
-
-
-def calculate_dimensions(target_area, ratio):
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-
-    return width, height, None
 
 
 def build_z_image_model_with_lora(z_image_module, config, model_kwargs, lora_configs):
@@ -53,15 +44,10 @@ def build_z_image_model_with_lora(z_image_module, config, model_kwargs, lora_con
 class ZImageRunner(DefaultRunner):
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
-
-    def __init__(self, config):
-        super().__init__(config)
-
-    @ProfilingContext4DebugL2("Load models")
-    def load_model(self):
-        self.model = self.load_transformer()
-        self.text_encoders = self.load_text_encoder()
-        self.vae = self.load_vae()
+    supported_request_fields_by_task = {
+        "t2i": IMAGE_REQUEST_FIELDS,
+        "i2i": IMAGE_REQUEST_FIELDS | {"i2i_denoise_strength", "image_path"},
+    }
 
     def load_transformer(self):
         z_image_model_kwargs = {
@@ -159,7 +145,11 @@ class ZImageRunner(DefaultRunner):
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_i2i(self):
-        image_paths_list = self.input_info.image_path.split(",")
+        self.input_info.original_size.clear()
+        image_paths_list = [image_path.strip() for image_path in self.input_info.image_path.split(",") if image_path.strip()]
+        if len(image_paths_list) != 1:
+            raise ValueError(f"z-image i2i currently supports exactly one input image, got {len(image_paths_list)}.")
+
         images_list = []
         for image_path in image_paths_list:
             _, image = self.read_image_input(image_path)
@@ -198,7 +188,7 @@ class ZImageRunner(DefaultRunner):
             # embedding_list[0] shape is (seq_len, hidden_dim), use shape[0] for sequence length
             self.input_info.txt_seq_lens = [prompt_embeds.shape[0]]
             text_encoder_output["prompt_embeds"] = prompt_embeds
-            if self.config["enable_cfg"] and neg_prompt is not None:
+            if self.config["enable_cfg"]:
                 neg_prompt_embeds_list, _ = self.text_encoders[0].infer([neg_prompt])
                 neg_prompt_embeds = neg_prompt_embeds_list[0]
                 self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[0])
@@ -212,7 +202,7 @@ class ZImageRunner(DefaultRunner):
                 self.input_info.txt_seq_lens = [prompt_embeds.shape[0]]
                 text_encoder_output["prompt_embeds"] = prompt_embeds
                 text_encoder_output["image_info"] = image_info
-                if self.config["enable_cfg"] and neg_prompt is not None:
+                if self.config["enable_cfg"]:
                     neg_prompt_embeds_list, _ = self.text_encoders[0].infer([neg_prompt], image_list)
                     neg_prompt_embeds = neg_prompt_embeds_list[0]
                     self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[0])
@@ -223,7 +213,7 @@ class ZImageRunner(DefaultRunner):
                 prompt_embeds = prompt_embeds_list[0]
                 self.input_info.txt_seq_lens = [prompt_embeds.shape[0]]
                 text_encoder_output["prompt_embeds"] = prompt_embeds
-                if self.config["enable_cfg"] and neg_prompt is not None:
+                if self.config["enable_cfg"]:
                     neg_prompt_embeds_list, _ = self.text_encoders[0].infer([neg_prompt])
                     neg_prompt_embeds = neg_prompt_embeds_list[0]
                     self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[0])
@@ -234,7 +224,7 @@ class ZImageRunner(DefaultRunner):
             prompt_embeds = prompt_embeds_list[0]
             self.input_info.txt_seq_lens = [prompt_embeds.shape[0]]
             text_encoder_output["prompt_embeds"] = prompt_embeds
-            if self.config["enable_cfg"] and neg_prompt is not None:
+            if self.config["enable_cfg"]:
                 neg_prompt_embeds_list, _ = self.text_encoders[0].infer([neg_prompt])
                 neg_prompt_embeds = neg_prompt_embeds_list[0]
                 self.input_info.txt_seq_lens.append(neg_prompt_embeds.shape[0])
@@ -278,16 +268,18 @@ class ZImageRunner(DefaultRunner):
             "16:9": [1664, 928],
             "9:16": [928, 1664],
             "1:1": [1328, 1328],
-            "4:3": [1472, 1140],
-            "3:4": [768, 1024],
+            "4:3": [1472, 1104],
+            "3:4": [1104, 1472],
+            "3:2": (1584, 1056),
+            "2:3": (1056, 1584),
         }
         as_maps = self.config.get("aspect_ratios", {})
         as_maps.update(default_aspect_ratios)
         max_size = self.config.get("max_custom_size", 1664)
         min_size = self.config.get("min_custom_size", 256)
 
-        if len(self.input_info.target_shape) == 2:
-            height, width = self.input_info.target_shape
+        if len(self.input_info.size) == 2:
+            height, width = self.input_info.size
             height, width = int(height), int(width)
             if width > max_size or height > max_size:
                 scale = max_size / max(width, height)
@@ -297,7 +289,18 @@ class ZImageRunner(DefaultRunner):
             logger.info(f"Z Image Runner got custom shape: {width}x{height}")
             return (width, height)
 
-        aspect_ratio = self.input_info.aspect_ratio if self.input_info.aspect_ratio else self.config.get("aspect_ratio", None)
+        aspect_ratio = self.input_info.aspect_ratio
+        if aspect_ratio in as_maps:
+            logger.info(f"Z Image Runner got aspect ratio: {aspect_ratio}")
+            width, height = as_maps[aspect_ratio]
+            return (width, height)
+
+        if self.config["task"] == "i2i" and self.input_info.original_size:
+            width, height = self.input_info.original_size[-1]
+            logger.info(f"Z Image Runner got i2i source image shape: {width}x{height}")
+            return (width, height)
+
+        aspect_ratio = self.config.get("aspect_ratio", None)
         if aspect_ratio in as_maps:
             logger.info(f"Z Image Runner got aspect ratio: {aspect_ratio}")
             width, height = as_maps[aspect_ratio]
@@ -306,8 +309,9 @@ class ZImageRunner(DefaultRunner):
 
         raise NotImplementedError
 
-    def set_target_shape(self):
-        height, width = self.get_input_target_shape()
+    def set_latent_shape(self):
+        width, height = self.get_input_target_shape()
+        self.input_info.size = [height, width]
 
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
@@ -316,26 +320,10 @@ class ZImageRunner(DefaultRunner):
         height = 2 * (int(height) // (vae_scale_factor * 2))
         width = 2 * (int(width) // (vae_scale_factor * 2))
         num_channels_latents = self.config.get("num_channels_latents", 16)
-        self.input_info.target_shape = (1, num_channels_latents, height, width)
-
-    def set_img_shapes(self):
-        if hasattr(self.input_info, "target_shape") and self.input_info.target_shape is not None:
-            if len(self.input_info.target_shape) != 4:
-                raise ValueError(f"target_shape must be 4D [B, C, H, W], got {len(self.input_info.target_shape)}D: {self.input_info.target_shape}")
-            _, _, latent_height, latent_width = self.input_info.target_shape
-        else:
-            height, width = self.get_input_target_shape()
-
-            vae_scale_factor = self.config["vae_scale_factor"]
-            latent_height = 2 * (int(height) // (vae_scale_factor * 2))
-            latent_width = 2 * (int(width) // (vae_scale_factor * 2))
+        self.input_info.latent_shape = (1, num_channels_latents, height, width)
 
         patch_size = self.config.get("patch_size", 2)
-        patch_height = latent_height // patch_size
-        patch_width = latent_width // patch_size
-
-        image_shapes = [(1, patch_height, patch_width)]
-        self.input_info.image_shapes = image_shapes
+        self.input_info.image_shapes = [(1, height // patch_size, width // patch_size)]
 
     def init_scheduler(self):
         self.scheduler = ZImageScheduler(self.config)
@@ -377,15 +365,14 @@ class ZImageRunner(DefaultRunner):
         if self.config["task"] == "i2i" and "image_encoder_output" in self.inputs:
             self.input_info.image_encoder_output = self.inputs["image_encoder_output"]
 
-        self.set_target_shape()
-        self.set_img_shapes()
+        self.set_latent_shape()
         logger.info(f"input_info: {self.input_info}")
 
         latents, generator = self.run_dit()
         images = self.run_vae_decoder(latents)
         self.end_run()
 
-        if not input_info.return_result_tensor:
+        if not input_info.return_result_tensor and input_info.save_result_path is not None and is_main_process():
             image = images[0]
             image.save(input_info.save_result_path)
             logger.info(f"Image saved: {input_info.save_result_path}")

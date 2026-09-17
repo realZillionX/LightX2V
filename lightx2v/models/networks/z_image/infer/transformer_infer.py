@@ -3,8 +3,6 @@ import torch.nn.functional as F
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 
-from .utils import apply_rotary_emb_qwen, apply_wan_rope_with_flashinfer
-
 
 class ZImageTransformerInfer(BaseTransformerInfer):
     def __init__(self, config):
@@ -16,14 +14,16 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         self.n_heads = config.get("n_heads", config.get("num_attention_heads", 24))
         if self.config["seq_parallel"]:
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
+            self.seq_p_fp8_comm = self.config["parallel"].get("seq_p_fp8_comm", False)
+            self.seq_p_fp4_comm = self.config["parallel"].get("seq_p_fp4_comm", False)
+            self.enable_head_parallel = self.config["parallel"].get("seq_p_head_parallel", False)
+            self.seq_p_tensor_fusion = self.config["parallel"].get("seq_p_tensor_fusion", False)
         else:
             self.seq_p_group = None
-        self.seq_p_fp8_comm = False
-        self.seq_p_fp4_comm = False
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            self.apply_rope_func = apply_wan_rope_with_flashinfer
-        else:
-            self.apply_rope_func = apply_rotary_emb_qwen
+            self.seq_p_fp8_comm = False
+            self.seq_p_fp4_comm = False
+            self.enable_head_parallel = False
+            self.seq_p_tensor_fusion = False
 
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
@@ -42,7 +42,16 @@ class ZImageTransformerInfer(BaseTransformerInfer):
 
         return scale_msa, gate_msa, scale_mlp, gate_mlp
 
-    def infer_attn(self, attn_phase, hidden_states, freqs_cis, scale_msa=None):
+    def infer_attn(
+        self,
+        attn_phase,
+        hidden_states,
+        freqs_cis,
+        rope_positions,
+        scale_msa=None,
+        image_tokens_len=None,
+        q_only_img=False,
+    ):
         norm1_out = attn_phase.attention_norm1.apply(hidden_states)
         if scale_msa is not None:
             scaled_norm1 = norm1_out * scale_msa
@@ -62,23 +71,38 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         if attn_phase.norm_k is not None:
             key = attn_phase.norm_k.apply(key)
 
-        query, key = self.apply_rope_func(query, key, freqs_cis)
+        if rope_positions is None:
+            query, key = attn_phase.rope.apply(query, key, freqs_cis)
+        else:
+            query, key = attn_phase.rope.apply(query, key, freqs_cis, positions=rope_positions)
 
         total_seq_len = query.shape[0]
         cu_seqlens = torch.tensor([0, total_seq_len], dtype=torch.int32, device="cpu")
 
-        if self.config["seq_parallel"]:
+        if self.config["seq_parallel"] and image_tokens_len is not None:
+            world_size = torch.distributed.get_world_size(self.seq_p_group)
+            num_heads = query.shape[1]
+            if num_heads % world_size != 0:
+                raise ValueError(
+                    f"Z-Image Ulysses sequence parallel requires attention heads ({num_heads}) "
+                    f"to be divisible by seq_p_size ({world_size}). Please choose a seq_p_size "
+                    "that divides the head count, such as 2, 3, 5, 6, 10, 15, or 30 for this Z-Image model."
+                )
+
             hidden_states_out = attn_phase.calculate_parallel.apply(
                 q=query,
                 k=key,
                 v=value,
-                slice_qkv_len=total_seq_len,
+                slice_qkv_len=image_tokens_len,
                 cu_seqlens_qkv=cu_seqlens,
                 attention_module=attn_phase.calculate,
                 seq_p_group=self.seq_p_group,
                 use_fp8_comm=self.seq_p_fp8_comm,
                 use_fp4_comm=self.seq_p_fp4_comm,
-                img_first=False,
+                use_tensor_fusion=self.seq_p_tensor_fusion,
+                enable_head_parallel=self.enable_head_parallel,
+                img_first=True,
+                q_only_img=q_only_img,
             )
         else:
             # todo
@@ -117,14 +141,25 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         block_weight,
         hidden_states,
         freqs_cis,
+        rope_positions,
         adaln_input=None,
+        image_tokens_len=None,
+        q_only_img=False,
     ):
         mod_phase = block_weight.compute_phases[0] if block_weight.has_modulation else None
         attn_phase = block_weight.compute_phases[1]
         ffn_phase = block_weight.compute_phases[2]
 
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.infer_mod(mod_phase, hidden_states, adaln_input)
-        attn_out = self.infer_attn(attn_phase, hidden_states, freqs_cis, scale_msa)
+        attn_out = self.infer_attn(
+            attn_phase,
+            hidden_states,
+            freqs_cis,
+            rope_positions,
+            scale_msa,
+            image_tokens_len=image_tokens_len,
+            q_only_img=q_only_img,
+        )
 
         if gate_msa is not None:
             hidden_states.add_(gate_msa * attn_out)
@@ -147,17 +182,22 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         noise_refiner_blocks,
         hidden_states,
         x_freqs_cis,
+        x_rope_positions,
         adaln_input,
         x_len,
     ):
         x_hidden = hidden_states[:x_len]
         x_freqs = x_freqs_cis[:x_len]
+        x_positions = x_rope_positions[:x_len] if x_rope_positions is not None else None
         for block_weight in noise_refiner_blocks:
             x_hidden = self.infer_block(
                 block_weight=block_weight,
                 hidden_states=x_hidden,
                 freqs_cis=x_freqs,
+                rope_positions=x_positions,
                 adaln_input=adaln_input,
+                image_tokens_len=x_hidden.shape[0],
+                q_only_img=True,
             )
 
         return x_hidden
@@ -167,16 +207,20 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         context_refiner_blocks,
         encoder_hidden_states,
         cap_freqs_cis,
+        cap_rope_positions,
         cap_len,
     ):
         cap_hidden = encoder_hidden_states[:cap_len]
         cap_freqs = cap_freqs_cis[:cap_len]
+        cap_positions = cap_rope_positions[:cap_len] if cap_rope_positions is not None else None
         for block_weight in context_refiner_blocks:
             cap_hidden = self.infer_block(
                 block_weight=block_weight,
                 hidden_states=cap_hidden,
                 freqs_cis=cap_freqs,
+                rope_positions=cap_positions,
                 adaln_input=None,
+                image_tokens_len=None,
             )
 
         return cap_hidden
@@ -186,20 +230,21 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         main_blocks,
         hidden_states,
         encoder_hidden_states,
-        x_freqs_cis,
-        cap_freqs_cis,
+        unified_freqs_cis,
+        unified_rope_positions,
         adaln_input,
         x_len,
         cap_len,
     ):
         unified = torch.cat([hidden_states, encoder_hidden_states], dim=0)
-        unified_freqs_cis = torch.cat([x_freqs_cis[:x_len], cap_freqs_cis[:cap_len]], dim=0)
         for block_weight in main_blocks:
             unified = self.infer_block(
                 block_weight=block_weight,
                 hidden_states=unified,
                 freqs_cis=unified_freqs_cis,
+                rope_positions=unified_rope_positions,
                 adaln_input=adaln_input,
+                image_tokens_len=x_len,
             )
 
         return unified
@@ -211,6 +256,10 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         encoder_hidden_states,
         x_freqs_cis,
         cap_freqs_cis,
+        unified_freqs_cis,
+        x_rope_positions,
+        cap_rope_positions,
+        unified_rope_positions,
         adaln_input,
         x_item_seqlens,
         cap_item_seqlens,
@@ -223,6 +272,7 @@ class ZImageTransformerInfer(BaseTransformerInfer):
             noise_refiner_blocks=block_weights.noise_refiner,
             hidden_states=hidden_states,
             x_freqs_cis=x_freqs_cis,
+            x_rope_positions=x_rope_positions,
             adaln_input=adaln_input,
             x_len=x_len,
         )
@@ -232,6 +282,7 @@ class ZImageTransformerInfer(BaseTransformerInfer):
             context_refiner_blocks=block_weights.context_refiner,
             encoder_hidden_states=encoder_hidden_states,
             cap_freqs_cis=cap_freqs_cis,
+            cap_rope_positions=cap_rope_positions,
             cap_len=cap_len,
         )
 
@@ -240,8 +291,8 @@ class ZImageTransformerInfer(BaseTransformerInfer):
             main_blocks=block_weights.blocks,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            x_freqs_cis=x_freqs_cis,
-            cap_freqs_cis=cap_freqs_cis,
+            unified_freqs_cis=unified_freqs_cis,
+            unified_rope_positions=unified_rope_positions,
             adaln_input=adaln_input,
             x_len=x_len,
             cap_len=cap_len,
@@ -257,6 +308,7 @@ class ZImageTransformerInfer(BaseTransformerInfer):
         cap_item_seqlens = pre_infer_out.cap_item_seqlens
         x_freqs_cis = pre_infer_out.x_freqs_cis
         cap_freqs_cis = pre_infer_out.cap_freqs_cis
+        unified_freqs_cis = pre_infer_out.unified_freqs_cis
 
         hidden_states = self.infer_calculating(
             block_weights=block_weights,
@@ -264,6 +316,10 @@ class ZImageTransformerInfer(BaseTransformerInfer):
             encoder_hidden_states=encoder_hidden_states,
             x_freqs_cis=x_freqs_cis,
             cap_freqs_cis=cap_freqs_cis,
+            unified_freqs_cis=unified_freqs_cis,
+            x_rope_positions=pre_infer_out.x_rope_positions,
+            cap_rope_positions=pre_infer_out.cap_rope_positions,
+            unified_rope_positions=pre_infer_out.unified_rope_positions,
             adaln_input=adaln_input,
             x_item_seqlens=x_item_seqlens,
             cap_item_seqlens=cap_item_seqlens,

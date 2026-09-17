@@ -9,7 +9,7 @@ from lightx2v.disagg.utils import (
     load_wan_vae_decoder,
     set_config,
 )
-from lightx2v.models.schedulers.wan.scheduler import WanScheduler
+from lightx2v.models.schedulers.wan.scheduler_factory import create_wan_scheduler
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import save_to_video, seed_all, wan_vae_to_comfy
 
@@ -38,9 +38,8 @@ def main():
         # Configuration parameters from pipe.create_generator in original example
         attn_mode="sage_attn2",
         infer_steps=50,
-        target_height=480,
-        target_width=832,
-        target_video_length=81,
+        size=(480, 832),
+        num_frames=81,
         sample_guide_scale=5.0,
         sample_shift=5.0,
         fps=16,
@@ -68,7 +67,7 @@ def main():
 
     # 3. Initialize Scheduler
     # Only supporting basic NoCaching scheduler for this simple example as per default config
-    scheduler = WanScheduler(config)
+    scheduler = create_wan_scheduler(config)
     model.set_scheduler(scheduler)
 
     # 4. Run Inference Pipeline
@@ -99,11 +98,11 @@ def main():
 
     # Calculate latent shape
     # Logic from DefaultRunner.get_latent_shape_with_target_hw
-    latent_h = config["target_height"] // config["vae_stride"][1]
-    latent_w = config["target_width"] // config["vae_stride"][2]
+    latent_h = config["size"][0] // config["vae_stride"][1]
+    latent_w = config["size"][1] // config["vae_stride"][2]
     latent_shape = [
         config.get("num_channels_latents", 16),
-        (config["target_video_length"] - 1) // config["vae_stride"][0] + 1,
+        (config["num_frames"] - 1) // config["vae_stride"][0] + 1,
         latent_h,
         latent_w,
     ]

@@ -30,24 +30,25 @@ class WanPreWeights(WeightModule):
                     lora_prefix="diffusion_model.ref_patch_embedding",
                 ),
             )
-            self.add_module(
-                "prev_patch_embedding",
-                CONV3D_WEIGHT_REGISTER["Default"](
-                    "prev_patch_embedding.weight",
-                    "prev_patch_embedding.bias",
-                    stride=self.patch_size,
-                    lora_prefix="diffusion_model.prev_patch_embedding",
-                ),
-            )
-            self.add_module(
-                "cont_patch_embedding",
-                CONV3D_WEIGHT_REGISTER["Default"](
-                    "cont_patch_embedding.weight",
-                    "cont_patch_embedding.bias",
-                    stride=self.patch_size,
-                    lora_prefix="diffusion_model.cont_patch_embedding",
-                ),
-            )
+            if config["model_cls"] != "seko_talk_ar":
+                self.add_module(
+                    "prev_patch_embedding",
+                    CONV3D_WEIGHT_REGISTER["Default"](
+                        "prev_patch_embedding.weight",
+                        "prev_patch_embedding.bias",
+                        stride=self.patch_size,
+                        lora_prefix="diffusion_model.prev_patch_embedding",
+                    ),
+                )
+                self.add_module(
+                    "cont_patch_embedding",
+                    CONV3D_WEIGHT_REGISTER["Default"](
+                        "cont_patch_embedding.weight",
+                        "cont_patch_embedding.bias",
+                        stride=self.patch_size,
+                        lora_prefix="diffusion_model.cont_patch_embedding",
+                    ),
+                )
             self.add_module(
                 "state_embedding",
                 EMBEDDING_WEIGHT_REGISTER["Default"](
@@ -97,11 +98,15 @@ class WanPreWeights(WeightModule):
         )
 
         if config["task"] in ["i2v", "flf2v", "animate", "s2v", "rs2v"] and config.get("use_image_encoder", True):
+            # Wan-Animate-2's MLPProj uses nn.LayerNorm's default epsilon.
+            # Preserve the established epsilon for all other Wan variants.
+            image_proj_norm_eps = 1e-5 if config["model_cls"] == "wan2.2_animate2_distilled" else 1e-6
             self.add_module(
                 "proj_0",
-                LN_WEIGHT_REGISTER["torch"](
+                LN_WEIGHT_REGISTER[config.get("layer_norm_type", "torch")](
                     "img_emb.proj.0.weight",
                     "img_emb.proj.0.bias",
+                    eps=image_proj_norm_eps,
                     lora_prefix="diffusion_model.img_emb",
                 ),
             )
@@ -123,14 +128,17 @@ class WanPreWeights(WeightModule):
             )
             self.add_module(
                 "proj_4",
-                LN_WEIGHT_REGISTER["torch"](
+                LN_WEIGHT_REGISTER[config.get("layer_norm_type", "torch")](
                     "img_emb.proj.4.weight",
                     "img_emb.proj.4.bias",
+                    eps=image_proj_norm_eps,
                     lora_prefix="diffusion_model.img_emb",
                 ),
             )
 
-        if config["model_cls"] == "wan2.1_distill" and config.get("enable_dynamic_cfg", False):
+        wan21_distill_method = config.get("distill_method") if config["model_cls"] == "wan2.1" else None
+
+        if wan21_distill_method == "dmd2" and config.get("enable_dynamic_cfg", False):
             self.add_module(
                 "cfg_cond_proj_1",
                 MM_WEIGHT_REGISTER["Default"](
@@ -146,7 +154,7 @@ class WanPreWeights(WeightModule):
                 ),
             )
 
-        if config["model_cls"] == "wan2.1_mean_flow_distill":
+        if wan21_distill_method == "mean_flow":
             self.add_module(
                 "time_embedding_r_0",
                 MM_WEIGHT_REGISTER["Default"]("time_embedding_r.0.weight", "time_embedding_r.0.bias"),
@@ -161,7 +169,7 @@ class WanPreWeights(WeightModule):
                 "emb_pos",
                 TENSOR_REGISTER["Default"](f"img_emb.emb_pos"),
             )
-        if config["task"] == "animate":
+        if config["task"] == "animate" and config.get("model_cls") != "wan2.2_animate2_distilled":
             self.add_module(
                 "pose_patch_embedding",
                 CONV3D_WEIGHT_REGISTER["Default"](

@@ -51,9 +51,9 @@ class WanLingbotFastPreInfer(WanLingbotPreInfer):
         if c2ws_plucker_emb.dim() != 5:
             return {}
 
-        seg_start = self.scheduler.seg_index * self.scheduler.num_frame_per_block
+        seg_start = self.scheduler.seg_index * self.scheduler.num_frame_per_chunk
         seg_end = min(
-            (self.scheduler.seg_index + 1) * self.scheduler.num_frame_per_block,
+            (self.scheduler.seg_index + 1) * self.scheduler.num_frame_per_chunk,
             self.scheduler.num_output_frames,
         )
         sliced = c2ws_plucker_emb[:, :, seg_start:seg_end, :, :]
@@ -78,9 +78,9 @@ class WanLingbotFastPreInfer(WanLingbotPreInfer):
         vae_encoder_out = image_encoder_output.get("vae_encoder_out", None)
 
         if vae_encoder_out is not None:
-            seg_start = self.scheduler.seg_index * self.scheduler.num_frame_per_block
+            seg_start = self.scheduler.seg_index * self.scheduler.num_frame_per_chunk
             seg_end = min(
-                (self.scheduler.seg_index + 1) * self.scheduler.num_frame_per_block,
+                (self.scheduler.seg_index + 1) * self.scheduler.num_frame_per_chunk,
                 self.scheduler.num_output_frames,
             )
             vae_chunk = vae_encoder_out[:, seg_start:seg_end]
@@ -120,7 +120,7 @@ class WanLingbotFastPreInfer(WanLingbotPreInfer):
         if self.cos_sin is None or self.grid_sizes != grid_sizes.tuple:
             freqs = self.freqs.clone()
             self.grid_sizes = grid_sizes.tuple
-            self.cos_sin = self.prepare_cos_sin(grid_sizes.tuple, freqs)
+            self.cos_sin = self.prepare_rope_cache(self.prepare_cos_sin(grid_sizes.tuple, freqs))
 
         result = WanSFPreInferModuleOutput(
             embed=embed,

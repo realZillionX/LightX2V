@@ -1,8 +1,15 @@
 # isort: skip_file
 import ctypes
+import glob
 import os
 
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
+_cute_fmha_loaded = False
+_cute_fmha_minimax_h3_loaded = False
+_cute_fmha_minimax_h3_sparse_loaded = False
+_rms_norm_loaded = False
+_minimax_h3_rope_loaded = False
+_minimax_h3_qkv_norm_loaded = False
 
 if os.name == "nt":
     os.add_dll_directory(_pkg_dir)
@@ -22,6 +29,288 @@ if os.name == "nt":
         ctypes.CDLL(_dll)
     else:
         raise FileNotFoundError(f"esimd.unify.lgrf.dll not found in {_pkg_dir}")
+else:
+    # Load explicitly with global visibility so the extension can resolve the
+    # ESIMD entry points even on distributions that default to local dlopen.
+    _so = os.path.join(_pkg_dir, "libesimd.unify.lgrf.so")
+    if os.path.isfile(_so):
+        ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+    else:
+        raise FileNotFoundError(f"libesimd.unify.lgrf.so not found in {_pkg_dir}")
 
-from sycl_kernels._ext import sdp, onednn_w4a16, onednn_w8a16_fp8  # noqa: E402, F401
+try:
+    from sycl_kernels._ext import (  # noqa: E402, F401
+        onednn_w4a16,
+        onednn_w8a8_int8,
+        onednn_w8a16_fp8,
+        fp8_cache_clear,
+        fp8_cache_stats,
+        fp8_failure_cache_stats,
+        sdp,
+    )
+except ImportError as _legacy_import_error:
+
+    def _legacy_extension_unavailable(*args, _error=_legacy_import_error, **kwargs):
+        raise RuntimeError("sycl_kernels legacy ESIMD/oneDNN extension could not be loaded; check that the oneDNN headers and libdnnl runtime have matching versions") from _error
+
+    onednn_w4a16 = _legacy_extension_unavailable
+    onednn_w8a8_int8 = _legacy_extension_unavailable
+    onednn_w8a16_fp8 = _legacy_extension_unavailable
+    fp8_cache_clear = _legacy_extension_unavailable
+    fp8_cache_stats = _legacy_extension_unavailable
+    fp8_failure_cache_stats = _legacy_extension_unavailable
+    sdp = _legacy_extension_unavailable
 from sycl_kernels.version import __version__  # noqa: E402, F401
+
+
+def _load_rms_norm():
+    global _rms_norm_loaded
+    if _rms_norm_loaded:
+        return
+    import torch
+
+    suffix = "*.pyd" if os.name == "nt" else "*.so"
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "rms_norm_torch" + suffix)))
+    if not candidates:
+        raise ImportError(f"rms_norm_torch library not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _rms_norm_loaded = True
+
+
+def rms_norm(weight, input, eps=1e-6):
+    """Run ESIMD RMSNorm on contiguous [rows, hidden_size] XPU tensors."""
+    import torch
+
+    try:
+        op = torch.ops.sycl_kernels_rms.rms_norm
+    except AttributeError:
+        _load_rms_norm()
+        op = torch.ops.sycl_kernels_rms.rms_norm
+    return op(weight, input, eps)
+
+
+def has_rms_norm():
+    try:
+        _load_rms_norm()
+        return True
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _load_minimax_h3_rope():
+    global _minimax_h3_rope_loaded
+    if _minimax_h3_rope_loaded:
+        return
+    import torch
+
+    suffix = "*.pyd" if os.name == "nt" else "*.so"
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "minimax_h3_rope_torch" + suffix)))
+    if not candidates:
+        raise ImportError(f"minimax_h3_rope_torch library not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _minimax_h3_rope_loaded = True
+
+
+def minimax_h3_rope(input, freqs):
+    """Apply MiniMax-H3 partial split-half RoPE to BF16 [rows, heads, 128]."""
+    import torch
+
+    try:
+        op = torch.ops.sycl_kernels_minimax_h3.rope
+    except AttributeError:
+        _load_minimax_h3_rope()
+        op = torch.ops.sycl_kernels_minimax_h3.rope
+    return op(input, freqs)
+
+
+def minimax_h3_rope_cached(input, cos, sin):
+    """Apply MiniMax-H3 RoPE using precomputed FP32 cosine and sine caches."""
+    import torch
+
+    try:
+        op = torch.ops.sycl_kernels_minimax_h3.rope_cached
+    except AttributeError:
+        _load_minimax_h3_rope()
+        op = torch.ops.sycl_kernels_minimax_h3.rope_cached
+    return op(input, cos, sin)
+
+
+def has_minimax_h3_rope():
+    try:
+        _load_minimax_h3_rope()
+        return True
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _load_minimax_h3_qkv_norm():
+    global _minimax_h3_qkv_norm_loaded
+    if _minimax_h3_qkv_norm_loaded:
+        return
+    import torch
+
+    suffix = "*.pyd" if os.name == "nt" else "*.so"
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "minimax_h3_qkv_norm_torch" + suffix)))
+    if not candidates:
+        raise ImportError(f"minimax_h3_qkv_norm_torch library not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _minimax_h3_qkv_norm_loaded = True
+
+
+def minimax_h3_qkv_norm_rope(q, k, v, q_weight, k_weight, cos, sin, q_eps, k_eps, low_precision_rope=False):
+    """Fused XPU Q/K RMSNorm and 96-dimensional split-half RoPE (head_dim=128)."""
+    import torch
+
+    _load_minimax_h3_qkv_norm()
+    return torch.ops.sycl_kernels_minimax_h3_qkv.qkv_norm_rope(q, k, v, q_weight, k_weight, cos, sin, q_eps, k_eps, low_precision_rope)
+
+
+def has_minimax_h3_qkv_norm_rope():
+    import torch
+
+    try:
+        _load_minimax_h3_qkv_norm()
+        return hasattr(torch.ops.sycl_kernels_minimax_h3_qkv, "qkv_norm_rope")
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _load_cute_fmha():
+    global _cute_fmha_loaded
+
+    if os.name == "nt":
+        # The current sycl-tla FMHA kernel builds on Windows but produces
+        # incorrect attention results, so do not allow it to be loaded.
+        raise RuntimeError("CUTE FMHA is disabled on Windows because sycl-tla produces incorrect results")
+    if _cute_fmha_loaded:
+        return
+    import torch
+
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "cute_fmha_torch*.so")))
+    if not candidates:
+        raise ImportError(f"cute_fmha_torch.so not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _cute_fmha_loaded = True
+
+
+def _load_cute_fmha_minimax_h3():
+    global _cute_fmha_minimax_h3_loaded
+    if os.name == "nt":
+        raise RuntimeError("CUTE FMHA is disabled on Windows because sycl-tla produces incorrect results")
+    if _cute_fmha_minimax_h3_loaded:
+        return
+    import torch
+
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "cute_fmha_minimax_h3_torch*.so")))
+    if not candidates:
+        raise ImportError(f"cute_fmha_minimax_h3_torch.so not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _cute_fmha_minimax_h3_loaded = True
+
+
+def _load_cute_fmha_minimax_h3_sparse():
+    global _cute_fmha_minimax_h3_sparse_loaded
+    if _cute_fmha_minimax_h3_sparse_loaded:
+        return
+    import torch
+
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "cute_fmha_minimax_h3_sparse_torch*.so")))
+    if not candidates:
+        raise ImportError("cute_fmha_minimax_h3_sparse_torch.so not found")
+    torch.ops.load_library(candidates[0])
+    _cute_fmha_minimax_h3_sparse_loaded = True
+
+
+def _use_minimax_h3_cute(q, k, v):
+    import torch
+
+    return (
+        q.device.type == "xpu"
+        and q.dtype == torch.bfloat16
+        and q.ndim == 4
+        and q.shape[0] == 1
+        and q.shape[1] >= 18870
+        and q.shape[2] in (56, 28, 14, 7)
+        and q.shape[3] == 128
+        and tuple(k.shape) == tuple(q.shape)
+        and tuple(v.shape) == tuple(q.shape)
+        and k.device == q.device
+        and v.device == q.device
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+    )
+
+
+def cute_sdp(q, k, v):
+    """Run generic CUTLASS-SYCL CUTE self-attention on [B,L,H,128]."""
+    import torch
+
+    if _use_minimax_h3_cute(q, k, v):
+        try:
+            op = torch.ops.sycl_kernels_cute_minimax_h3.sdp
+        except AttributeError:
+            _load_cute_fmha_minimax_h3()
+            op = torch.ops.sycl_kernels_cute_minimax_h3.sdp
+        return op(q, k, v)
+
+    try:
+        op = torch.ops.sycl_kernels_cute.sdp
+    except AttributeError:
+        _load_cute_fmha()
+        op = torch.ops.sycl_kernels_cute.sdp
+    return op(q, k, v)
+
+
+def has_cute_fmha():
+    if os.name == "nt":
+        return False
+    try:
+        _load_cute_fmha()
+        return True
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def minimax_h3_vae_sdp_d64(q, k, v):
+    """Run the BMG MiniMax-H3 Video VAE FP16 D64 attention kernel."""
+    import torch
+
+    try:
+        op = torch.ops.sycl_kernels_cute.sdp_minimax_h3_vae_d64
+    except AttributeError:
+        _load_cute_fmha()
+        op = torch.ops.sycl_kernels_cute.sdp_minimax_h3_vae_d64
+    return op(q, k, v)
+
+
+def has_minimax_h3_vae_sdp_d64():
+    if os.name == "nt":
+        return False
+    try:
+        _load_cute_fmha()
+        import torch
+
+        return hasattr(torch.ops.sycl_kernels_cute, "sdp_minimax_h3_vae_d64")
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def sla_block_map(q, k, keep_ratio=0.2, block_q=128, block_k=128):
+    """Build an SLA block LUT for BLHD query/key tensors."""
+    from .sla import sla_block_map as _sla_block_map
+
+    return _sla_block_map(q, k, keep_ratio, block_q, block_k)
+
+
+def sparse_block_attention(q, k, v, lut, block_q=128, block_k=128, scale=None):
+    """Run fused BF16 block-sparse attention on Intel XPU."""
+    from .sla import sparse_block_attention as _sparse_block_attention
+
+    return _sparse_block_attention(q, k, v, lut, block_q, block_k, scale)
+
+
+def sla_sparse_attention(q, k, v, keep_ratio=0.2, block_q=128, block_k=128, scale=None):
+    """Build the SLA routing LUT and run fused sparse attention."""
+    from .sla import sla_sparse_attention as _sla_sparse_attention
+
+    return _sla_sparse_attention(q, k, v, keep_ratio, block_q, block_k, scale)

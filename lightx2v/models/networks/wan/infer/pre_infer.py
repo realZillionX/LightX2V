@@ -13,11 +13,13 @@ class WanPreInfer:
     def __init__(self, config):
         assert (config["dim"] % config["num_heads"]) == 0 and (config["dim"] // config["num_heads"]) % 2 == 0
         self.config = config
+        self.rope = None
         self.clean_cuda_cache = config.get("clean_cuda_cache", False)
         self.task = config["task"]
         self.freq_dim = config["freq_dim"]
         self.dim = config["dim"]
-        self.enable_dynamic_cfg = config.get("enable_dynamic_cfg", False)
+        self.wan21_distill_method = config.get("distill_method") if config["model_cls"] == "wan2.1" else None
+        self.enable_dynamic_cfg = self.wan21_distill_method == "dmd2" and config.get("enable_dynamic_cfg", False)
         self.cfg_scale = config.get("cfg_scale", 4.0)
         self.infer_dtype = GET_DTYPE()
         self.sensitive_layer_dtype = GET_SENSITIVE_DTYPE()
@@ -28,6 +30,7 @@ class WanPreInfer:
             self.seq_p_group = None
 
         self.cos_sin = None
+        self.rope_positions = None
         self.grid_sizes = (0, 0, 0)  # (t, h, w)
         self.head_size = self.config["dim"] // self.config["num_heads"]
         self.freqs = torch.cat(
@@ -52,6 +55,19 @@ class WanPreInfer:
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
 
+    def set_rope(self, rope):
+        self.rope = rope
+        self.cos_sin = None
+        self.rope_positions = None
+        self.grid_sizes = (0, 0, 0)
+
+    def prepare_rope_cache(self, freqs):
+        if self.rope is None:
+            raise RuntimeError("RoPE must be set before preparing the Wan frequency cache.")
+        freqs = self.rope.prepare_freqs(freqs, rotary_dim=self.head_size)
+        self.rope_positions = self.rope.prepare_positions(freqs)
+        return freqs
+
     def prepare_cos_sin(self, grid_sizes, freqs):
         c = self.head_size // 2
         freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -65,32 +81,15 @@ class WanPreInfer:
             ],
             dim=-1,
         )
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            cos_sin = cos_sin.reshape(seq_len, -1)
-            # Extract cos and sin parts separately and concatenate
-            cos_half = cos_sin.real.contiguous()
-            sin_half = cos_sin.imag.contiguous()
-            cos_sin = torch.cat([cos_half, sin_half], dim=-1)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = cos_sin.shape[0]
-                multiple = world_size * f
-                padding_size = (multiple - (seqlen % multiple)) % multiple
-                if padding_size > 0:
-                    cos_sin = F.pad(cos_sin, (0, 0, 0, padding_size))
-                cos_sin = torch.chunk(cos_sin, world_size, dim=0)[cur_rank]
-        else:
-            cos_sin = cos_sin.reshape(seq_len, 1, -1)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = cos_sin.shape[0]
-                multiple = world_size * f
-                padding_size = (multiple - (seqlen % multiple)) % multiple
-                if padding_size > 0:
-                    cos_sin = F.pad(cos_sin, (0, 0, 0, 0, 0, padding_size))
-                cos_sin = torch.chunk(cos_sin, world_size, dim=0)[cur_rank]
+        cos_sin = cos_sin.reshape(seq_len, 1, -1)
+        if self.seq_p_group is not None:
+            world_size = dist.get_world_size(self.seq_p_group)
+            cur_rank = dist.get_rank(self.seq_p_group)
+            seqlen = cos_sin.shape[0]
+            padding_size = (world_size - (seqlen % world_size)) % world_size
+            if padding_size > 0:
+                cos_sin = F.pad(cos_sin, (0, 0, 0, 0, 0, padding_size))
+            cos_sin = torch.chunk(cos_sin, world_size, dim=0)[cur_rank]
         return cos_sin
 
     @torch.no_grad()
@@ -98,7 +97,7 @@ class WanPreInfer:
         x = self.scheduler.latents
         t = self.scheduler.timestep_input
 
-        if self.config["model_cls"] == "wan2.1_mean_flow_distill":
+        if self.wan21_distill_method == "mean_flow":
             t_r = self.scheduler.timestep_input_r
 
         if self.scheduler.infer_condition:
@@ -116,13 +115,7 @@ class WanPreInfer:
                 image_encoder = inputs["image_encoder_output"]["vae_encoder_out"]
 
             if image_encoder is not None:
-                frame_seq_length = (image_encoder.size(2) // 2) * (image_encoder.size(3) // 2)
-                if kv_end - kv_start >= frame_seq_length:  # 如果是CausalVid, image_encoder取片段
-                    idx_s = kv_start // frame_seq_length
-                    idx_e = kv_end // frame_seq_length
-                    image_encoder = image_encoder[:, idx_s:idx_e, :, :]
-                y = image_encoder
-                x = torch.cat([x, y], dim=0)
+                x = torch.cat([x, image_encoder], dim=0)
 
         # embeddings
         x = weights.patch_embedding.apply(x.unsqueeze(0))
@@ -133,7 +126,7 @@ class WanPreInfer:
             motion_vec = None
 
         grid_sizes_t, grid_sizes_h, grid_sizes_w = x.shape[2:]
-        x = x.flatten(2).transpose(1, 2).contiguous()
+        x = x.flatten(2).transpose(1, 2).squeeze(0).contiguous()
         # seq_lens = torch.tensor(x.size(1), dtype=torch.int32).unsqueeze(0)
 
         embed = sinusoidal_embedding_1d(self.freq_dim, t.flatten())
@@ -152,7 +145,7 @@ class WanPreInfer:
         embed = weights.time_embedding_2.apply(embed)
         embed0 = torch.nn.functional.silu(embed)
 
-        if self.config["model_cls"] == "wan2.1_mean_flow_distill":
+        if self.wan21_distill_method == "mean_flow":
             embed_r = sinusoidal_embedding_1d(self.freq_dim, t_r.flatten())
             if self.sensitive_layer_dtype != self.infer_dtype:
                 embed_r = weights.time_embedding_r_0.apply(embed_r.to(self.sensitive_layer_dtype))
@@ -203,14 +196,15 @@ class WanPreInfer:
         if self.cos_sin is None or self.grid_sizes != grid_sizes.tuple:
             freqs = self.freqs.clone()  # self.freqs init param can not be changed
             self.grid_sizes = grid_sizes.tuple
-            self.cos_sin = self.prepare_cos_sin(grid_sizes.tuple, freqs)
+            self.cos_sin = self.prepare_rope_cache(self.prepare_cos_sin(grid_sizes.tuple, freqs))
 
         return WanPreInferModuleOutput(
             embed=embed,
             grid_sizes=grid_sizes,
-            x=x.squeeze(0),
+            x=x,
             embed0=embed0.squeeze(0),
             context=context,
             cos_sin=self.cos_sin,
+            rope_positions=self.rope_positions,
             adapter_args={"motion_vec": motion_vec},
         )

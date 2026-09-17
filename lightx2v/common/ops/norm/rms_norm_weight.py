@@ -5,7 +5,12 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
-from lightx2v.common.ops.norm.triton_ops import fused_norm_3drope, fused_qk_norm_3drope, rms_norm_kernel
+from lightx2v.common.ops.norm.triton_ops import (
+    fused_norm_3drope,
+    fused_qk_norm_3drope,
+    fused_qk_rms_norm,
+    rms_norm_kernel,
+)
 from lightx2v.common.ops.utils import *
 from lightx2v.utils.envs import *
 from lightx2v.utils.registry_factory import RMS_WEIGHT_REGISTER
@@ -13,8 +18,46 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 try:
     import sgl_kernel
+    from sgl_kernel.utils import is_arch_support_pdl
 except ImportError:
     sgl_kernel = None
+    is_arch_support_pdl = None
+
+try:
+    from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+except ImportError:
+    flashinfer_rmsnorm = None
+
+try:
+    from magi_compiler import magi_register_custom_op
+except ImportError:
+    magi_register_custom_op = None
+
+from lightx2v.common.magi_custom_op_mode import use_magi_custom_ops
+
+
+@torch.library.custom_op(
+    "lightx2v::rmsnorm_flashinfer",
+    mutates_args=(),
+    device_types="cuda",
+)
+def rmsnorm_flashinfer(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    return flashinfer_rmsnorm(input_tensor, weight, eps, enable_pdl=enable_pdl)
+
+
+@rmsnorm_flashinfer.register_fake
+def rmsnorm_flashinfer_fake(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    return torch.empty_like(input_tensor)
 
 
 class RMSWeightTemplate(metaclass=ABCMeta):
@@ -49,23 +92,34 @@ class RMSWeightTemplate(metaclass=ABCMeta):
 
     def _get_base_attrs_mapping(self):
         self.base_attrs = []
-        self.base_attrs.append((self.weight_name, "weight", False))
+        if self.weight_name is not None:
+            self.base_attrs.append((self.weight_name, "weight", False))
+        else:
+            self.weight = None
 
     def _get_lora_attr_mapping(self):
-        _, _, _, self.weight_diff_name, _ = build_lora_and_diff_names(self.weight_name, self.lora_prefix)
-        self.lora_attrs = {
-            "weight_diff": "weight_diff_name",
-        }
-        self.weight_diff = torch.tensor(0.0, dtype=GET_DTYPE(), device=AI_DEVICE)
+        if self.weight_name is not None:
+            _, _, _, self.weight_diff_name, _ = build_lora_and_diff_names(self.weight_name, self.lora_prefix)
+            self.lora_attrs = {
+                "weight_diff": "weight_diff_name",
+            }
+            self.weight_diff = torch.tensor(0.0, dtype=GET_DTYPE(), device=AI_DEVICE)
+        else:
+            self.weight_diff_name = None
+            self.lora_attrs = {}
 
     def _get_actual_weight(self):
+        if self.weight is None:
+            return None
         if not hasattr(self, "weight_diff"):
             return self.weight
+        if self.weight_diff.device != self.weight.device or self.weight_diff.dtype != self.weight.dtype:
+            self.weight_diff = self.weight_diff.to(device=self.weight.device, dtype=self.weight.dtype)
         return self.weight + self.weight_diff
 
     def register_diff(self, weight_dict):
         if not self.lazy_load or self.create_cuda_buffer or self.create_cpu_buffer:
-            if self.weight_diff_name in weight_dict:
+            if self.weight_diff_name is not None and self.weight_diff_name in weight_dict:
                 self.weight_diff = weight_dict[self.weight_diff_name]
                 logger.debug(f"Register Diff to {self.weight_name}")
 
@@ -126,14 +180,17 @@ class RMSWeightTemplate(metaclass=ABCMeta):
                     )
 
     def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
-        if self.has_lora_branch or self.has_diff:
-            self.load_lora_state_dict_from_disk(block_index)
-        self.weight_name = resolve_block_name(self.weight_name, block_index, adapter_block_index, self.is_post_adapter)
-        lazy_load_file_path = get_lazy_load_file_path(self.lazy_load_file, self.weight_name)
-        with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
-            weight_tensor = lazy_load_file.get_tensor(self.weight_name).to(self.infer_dtype)
-            self.pin_weight = self.pin_weight.copy_(weight_tensor)
-        del weight_tensor
+        if self.weight_name is not None:
+            if self.has_lora_branch or self.has_diff:
+                self.load_lora_state_dict_from_disk(block_index)
+            self.weight_name = resolve_block_name(self.weight_name, block_index, adapter_block_index, self.is_post_adapter)
+            lazy_load_file_path = get_lazy_load_file_path(self.lazy_load_file, self.weight_name)
+            with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
+                weight_tensor = lazy_load_file.get_tensor(self.weight_name).to(self.infer_dtype)
+                self.pin_weight = self.pin_weight.copy_(weight_tensor)
+            del weight_tensor
+        else:
+            self.weight = None
 
     @abstractmethod
     def apply(self, input_tensor):
@@ -170,11 +227,23 @@ class RMSWeight(RMSWeightTemplate):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def apply(self, input_tensor):
-        if GET_SENSITIVE_DTYPE() != GET_DTYPE():
-            input_tensor = self._norm(input_tensor).type_as(input_tensor) * (self._get_actual_weight())
+        if self.sensitive_layer_dtype != self.infer_dtype:
+            output = self._norm(input_tensor).type_as(input_tensor)
         else:
-            input_tensor = self._norm(input_tensor.float()).type_as(input_tensor) * (self._get_actual_weight())
-        return input_tensor
+            output = self._norm(input_tensor.float()).type_as(input_tensor)
+        weight = self._get_actual_weight()
+        return output if weight is None else output * weight
+
+
+@RMS_WEIGHT_REGISTER("torch_native")
+class RMSWeightNative(RMSWeight):
+    def apply(self, input_tensor):
+        return torch.nn.functional.rms_norm(
+            input_tensor,
+            (input_tensor.shape[-1],),
+            weight=self._get_actual_weight(),
+            eps=self.eps,
+        )
 
 
 @RMS_WEIGHT_REGISTER("TensorParallel")
@@ -228,12 +297,32 @@ class RMSWeightTP(RMSWeightTemplate):
 
         # Apply normalization with global mean
         if self.sensitive_layer_dtype != self.infer_dtype:
-            input_tensor = input_tensor * torch.rsqrt(global_mean.float() + self.eps).to(self.infer_dtype)
-            input_tensor = (input_tensor * self._get_actual_weight()).to(self.infer_dtype)
+            output = input_tensor * torch.rsqrt(global_mean.float() + self.eps).to(self.infer_dtype)
         else:
-            input_tensor = input_tensor * torch.rsqrt(global_mean + self.eps)
-            input_tensor = input_tensor * self._get_actual_weight()
-        return input_tensor
+            output = input_tensor * torch.rsqrt(global_mean + self.eps)
+        weight = self._get_actual_weight()
+        return output if weight is None else (output * weight).to(self.infer_dtype)
+
+
+@RMS_WEIGHT_REGISTER("TensorParallelFP32")
+class RMSWeightTPFP32(RMSWeightTP):
+    """Tensor-parallel RMSNorm with FP32 accumulation and computation."""
+
+    def apply(self, input_tensor):
+        input_dtype = input_tensor.dtype
+        input_fp32 = input_tensor.float()
+        local_sum = input_fp32.square().sum(dim=-1, keepdim=True)
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
+
+        global_hidden_dim = input_tensor.shape[-1] * self.tp_size
+        output = input_fp32 * torch.rsqrt(local_sum / global_hidden_dim + self.eps)
+
+        weight = self._get_actual_weight()
+        if weight is not None:
+            output = output * weight.float()
+        return output.to(input_dtype)
 
 
 @RMS_WEIGHT_REGISTER("sgl-kernel")
@@ -261,21 +350,27 @@ class RMSWeightSgl(RMSWeight):
             lora_prefix,
             lora_path,
         )
+        self.enable_pdl = is_arch_support_pdl() if is_arch_support_pdl is not None else False
 
     def apply(self, input_tensor):
-        if sgl_kernel is not None and self.sensitive_layer_dtype == self.infer_dtype:
+        weight = self._get_actual_weight()
+        if weight is not None and sgl_kernel is not None and self.sensitive_layer_dtype == self.infer_dtype:
             input_tensor = input_tensor.contiguous()
             orig_shape = input_tensor.shape
             input_tensor = input_tensor.view(-1, orig_shape[-1])
-            input_tensor = sgl_kernel.rmsnorm(input_tensor, (self._get_actual_weight()), self.eps).view(orig_shape)
+            if torch.compiler.is_compiling() and flashinfer_rmsnorm is not None and input_tensor.dtype in (torch.float16, torch.bfloat16):
+                input_tensor = rmsnorm_flashinfer(input_tensor, weight, self.eps, self.enable_pdl)
+            else:
+                input_tensor = sgl_kernel.rmsnorm(input_tensor, weight, self.eps, enable_pdl=self.enable_pdl)
+            input_tensor = input_tensor.view(orig_shape)
         else:
             # sgl_kernel is not available or dtype!=torch.bfloat16/float16, fallback to default implementation
             if self.sensitive_layer_dtype != self.infer_dtype:
                 input_tensor = input_tensor * torch.rsqrt(input_tensor.float().pow(2).mean(-1, keepdim=True) + self.eps).to(self.infer_dtype)
-                input_tensor = (input_tensor * (self._get_actual_weight())).to(self.infer_dtype)
             else:
                 input_tensor = input_tensor * torch.rsqrt(input_tensor.pow(2).mean(-1, keepdim=True) + self.eps)
-                input_tensor = input_tensor * (self._get_actual_weight())
+            if weight is not None:
+                input_tensor = (input_tensor * weight).to(self.infer_dtype)
 
         return input_tensor
 
@@ -311,10 +406,11 @@ class RMSWeightFP32(RMSWeight):
         variance = input_tensor.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = input_tensor * torch.rsqrt(variance + self.eps)
 
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-        if self.weight is not None:
-            hidden_states = hidden_states * (self._get_actual_weight())
+        weight = self._get_actual_weight()
+        if weight is not None:
+            if weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(weight.dtype)
+            hidden_states = hidden_states * weight
         hidden_states = hidden_states.to(input_dtype)
 
         return hidden_states
@@ -351,7 +447,8 @@ class RMSWeightFP32Qwen(RMSWeight):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states.to(input_dtype)
+        return hidden_states if self.weight is None else self.weight * hidden_states
 
 
 @RMS_WEIGHT_REGISTER("self_forcing")
@@ -384,7 +481,9 @@ class RMSWeightSF(RMSWeight):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def apply(self, x):
-        return self._norm(x.float()).type_as(x) * (self._get_actual_weight())
+        output = self._norm(x.float()).type_as(x)
+        weight = self._get_actual_weight()
+        return output if weight is None else output * weight
 
 
 @RMS_WEIGHT_REGISTER("one-pass")
@@ -414,7 +513,48 @@ class RMSWeightOnePass(RMSWeight):
         )
 
     def apply(self, input_tensor):
-        return rms_norm_kernel(input_tensor, (self._get_actual_weight()), self.eps)
+        w = self._get_actual_weight()
+        if w is None:
+            return torch.nn.functional.rms_norm(input_tensor, (input_tensor.shape[-1],), eps=self.eps)
+        if use_magi_custom_ops() and magi_register_custom_op is not None:
+            return torch.ops.lightx2v.rms_norm(input_tensor, w, self.eps)
+        return rms_norm_kernel(input_tensor, w, self.eps)
+
+
+def apply_qk_rms_norm(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    norm_q,
+    norm_k,
+    *,
+    use_triton: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if norm_q is None and norm_k is None:
+        return query, key
+
+    if use_triton and norm_q is not None and norm_k is not None and norm_q.eps == norm_k.eps and query.is_cuda and key.is_cuda and query.shape[-1] == key.shape[-1]:
+        q_shape = query.shape
+        k_shape = key.shape
+        head_dim = q_shape[-1]
+        q_flat = query.reshape(-1, head_dim)
+        k_flat = key.reshape(-1, head_dim)
+        q_flat, k_flat = fused_qk_rms_norm(
+            q_flat,
+            k_flat,
+            norm_q._get_actual_weight(),
+            norm_k._get_actual_weight(),
+            norm_q.eps,
+            match_torch_rms_cast=True,
+        )
+        return q_flat.reshape(q_shape), k_flat.reshape(k_shape)
+
+    if norm_q is not None:
+        q_shape = query.shape
+        query = norm_q.apply(query.reshape(-1, q_shape[-1])).reshape(q_shape)
+    if norm_k is not None:
+        k_shape = key.shape
+        key = norm_k.apply(key.reshape(-1, k_shape[-1])).reshape(k_shape)
+    return query, key
 
 
 class RMSWeightFusedQKNorm3DRope:

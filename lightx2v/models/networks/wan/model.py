@@ -25,9 +25,9 @@ from lightx2v.models.networks.wan.weights.pre_weights import WanPreWeights
 from lightx2v.models.networks.wan.weights.transformer_weights import (
     WanTransformerWeights,
 )
-from lightx2v.utils.custom_compiler import compiled_method
 from lightx2v.utils.envs import *
 from lightx2v.utils.utils import *
+from lightx2v_platform.base.global_var import AI_DEVICE
 
 
 class WanModel(BaseTransformerModel):
@@ -48,10 +48,146 @@ class WanModel(BaseTransformerModel):
             "before_proj",  # vace
             "after_proj",  # vace
         }
-        self.padding_multiple = self.config.get("padding_multiple", 1)
         self._init_infer_class()
         self._init_weights()
         self._init_infer()
+
+    # ------------------------------------------------------------------ TP --
+    def _rank_device(self):
+        if dist.is_initialized():
+            return torch.device(f"{AI_DEVICE}:{dist.get_rank()}")
+        return torch.device(AI_DEVICE)
+
+    def _get_split_type(self, key):
+        if not key.endswith(".weight"):
+            return None
+        col_infixes = (
+            ".self_attn.q.",
+            ".self_attn.k.",
+            ".self_attn.v.",
+            ".self_attn.norm_q.",
+            ".self_attn.norm_k.",
+            ".cross_attn.q.",
+            ".cross_attn.k.",
+            ".cross_attn.v.",
+            ".cross_attn.norm_q.",
+            ".cross_attn.norm_k.",
+            ".cross_attn.norm_k_img.",
+            ".cross_attn.k_img.",
+            ".cross_attn.v_img.",
+        )
+        row_infixes = (".self_attn.o.", ".cross_attn.o.", ".ffn.2.")
+        if any(s in key for s in col_infixes):
+            return "col"
+        if any(s in key for s in row_infixes):
+            return "row"
+        if ".ffn.0." in key:
+            return "col"
+        return None
+
+    def _split_bias_for_tp(self, bias, split_type, tp_size):
+        if split_type == "col":
+            if bias.shape[0] % tp_size != 0:
+                raise ValueError(f"Cannot split bias shape {tuple(bias.shape)} across tensor parallel size {tp_size}")
+            return list(torch.chunk(bias, tp_size, dim=0))
+        raise ValueError(f"Unsupported bias split_type: {split_type}")
+
+    def _split_weight_for_tp(self, key, weight, tp_size):
+        split_type = self._get_split_type(key)
+        if split_type == "col":
+            split_dim = 0
+        elif split_type == "row":
+            split_dim = 1
+        else:
+            raise ValueError(f"Unknown split_type for {key}")
+        if weight.shape[split_dim] % tp_size != 0:
+            raise ValueError(f"Cannot split {key} shape {tuple(weight.shape)} across tensor parallel size {tp_size} on dimension {split_dim}")
+        return list(torch.chunk(weight, tp_size, dim=split_dim))
+
+    def _should_load_weights(self):
+        if self.use_tp and self._use_local_tp_load():
+            return True
+        return super()._should_load_weights()
+
+    def _use_local_tp_load(self):
+        mode = self.config.get("parallel", {}).get("tp_load_mode", "broadcast")
+        if mode not in ("broadcast", "local"):
+            raise ValueError(f"Unsupported Wan TP load mode: {mode!r}; expected 'broadcast' or 'local'.")
+        return mode == "local"
+
+    def _shard_weights_locally(self, weight_dict):
+        local_weights = {}
+        processed_bias = set()
+        storage_device = self.device
+        for key, tensor in weight_dict.items():
+            split_type = self._get_split_type(key)
+            if key.endswith(".weight") and split_type is not None:
+                local_weights[key] = self._split_weight_for_tp(key, tensor, self.tp_size)[self.tp_rank].contiguous().to(storage_device)
+                bias_key = key.replace(".weight", ".bias")
+                if bias_key in weight_dict and split_type == "col":
+                    local_weights[bias_key] = self._split_bias_for_tp(weight_dict[bias_key], split_type, self.tp_size)[self.tp_rank].contiguous().to(storage_device)
+                    processed_bias.add(bias_key)
+            elif key not in processed_bias:
+                local_weights[key] = tensor.to(storage_device)
+        return local_weights
+
+    def _load_weights_from_rank0(self, weight_dict, is_weight_loader):
+        if not self.use_tp:
+            return super()._load_weights_from_rank0(weight_dict, is_weight_loader)
+
+        if self._use_local_tp_load():
+            if not is_weight_loader or weight_dict is None:
+                raise RuntimeError("Wan TP local loading requires every rank to load the shared checkpoint")
+            return self._shard_weights_locally(weight_dict)
+
+        src_rank = 0
+        target_device = self._rank_device()
+
+        if is_weight_loader:
+            processed, meta, processed_bias = {}, {}, set()
+            for key, tensor in weight_dict.items():
+                split_type = self._get_split_type(key)
+                if key.endswith(".weight") and split_type is not None:
+                    shards = self._split_weight_for_tp(key, tensor, self.tp_size)
+                    for r, shard in enumerate(shards):
+                        processed[f"{key}__tp_{r}"] = shard.contiguous()
+                    meta[key] = {"shape": shards[0].shape, "dtype": shards[0].dtype, "is_tp": True}
+                    bias_key = key.replace(".weight", ".bias")
+                    if bias_key in weight_dict and split_type == "col":
+                        bias_shards = self._split_bias_for_tp(weight_dict[bias_key], split_type, self.tp_size)
+                        for r, shard in enumerate(bias_shards):
+                            processed[f"{bias_key}__tp_{r}"] = shard.contiguous()
+                        meta[bias_key] = {"shape": bias_shards[0].shape, "dtype": bias_shards[0].dtype, "is_tp": True}
+                        processed_bias.add(bias_key)
+                elif key not in processed_bias:
+                    processed[key] = tensor
+                    meta[key] = {"shape": tensor.shape, "dtype": tensor.dtype, "is_tp": False}
+            obj_list = [meta]
+        else:
+            obj_list = [None]
+
+        dist.broadcast_object_list(obj_list, src=src_rank)
+        synced_meta = obj_list[0]
+
+        distributed = {k: torch.empty(m["shape"], dtype=m["dtype"], device=target_device) for k, m in synced_meta.items()}
+
+        for key in sorted(synced_meta.keys()):
+            m = synced_meta[key]
+            if m["is_tp"]:
+                for r in range(self.tp_size):
+                    buf = processed[f"{key}__tp_{r}"].to(target_device) if is_weight_loader else torch.empty(m["shape"], dtype=m["dtype"], device=target_device)
+                    dist.broadcast(buf, src=src_rank, group=self.tp_group)
+                    if r == self.tp_rank:
+                        distributed[key].copy_(buf)
+                    del buf
+            else:
+                if is_weight_loader:
+                    distributed[key].copy_(processed[key].to(target_device))
+                dist.broadcast(distributed[key], src=src_rank, group=self.tp_group)
+
+        return distributed
+
+    # ------------------------------------------------------------------ TP --
 
     def _init_infer_class(self):
         self.pre_infer_class = WanPreInfer
@@ -82,6 +218,12 @@ class WanModel(BaseTransformerModel):
         self.pre_infer = self.pre_infer_class(self.config)
         self.post_infer = self.post_infer_class(self.config)
         self.transformer_infer = self.transformer_infer_class(self.config)
+        if hasattr(self.pre_infer, "set_rope"):
+            first_attn = self.transformer_weights.blocks[0].compute_phases[0]
+            rope = getattr(first_attn, "dreamzero_rope", None)
+            self.pre_infer.set_rope(rope if rope is not None else first_attn.rope)
+        if hasattr(self.pre_infer, "set_audio_rope"):
+            self.pre_infer.set_audio_rope(self.transformer_weights.blocks[0].compute_phases[2].rope_1d)
         if hasattr(self.transformer_infer, "offload_manager"):
             self._init_offload_manager()
 
@@ -99,7 +241,6 @@ class WanModel(BaseTransformerModel):
                         return True
         return False
 
-    @compiled_method()
     @torch.no_grad()
     def _infer_cond_uncond(self, inputs, infer_condition=True):
         self.scheduler.infer_condition = infer_condition
@@ -127,15 +268,13 @@ class WanModel(BaseTransformerModel):
         x = pre_infer_out.x
         world_size = dist.get_world_size(self.seq_p_group)
         cur_rank = dist.get_rank(self.seq_p_group)
-        f, _, _ = pre_infer_out.grid_sizes.tuple
-        multiple = world_size * f
-        padding_size = (multiple - (x.shape[0] % multiple)) % multiple
+        padding_size = (world_size - (x.shape[0] % world_size)) % world_size
         if padding_size > 0:
             x = F.pad(x, (0, 0, 0, padding_size))
 
         pre_infer_out.x = torch.chunk(x, world_size, dim=0)[cur_rank]
 
-        if self.config["model_cls"] in ["wan2.2", "wan2.2_audio"] and self.config["task"] in ["i2v", "s2v", "rs2v"]:
+        if self.config["model_cls"] == "wan2.2" and self.config["task"] in ["i2v", "s2v", "rs2v"]:
             embed, embed0 = pre_infer_out.embed, pre_infer_out.embed0
 
             padding_size = (world_size - (embed.shape[0] % world_size)) % world_size
@@ -166,6 +305,7 @@ class WanModel(BaseTransformerModel):
                 self.transformer_weights.non_block_weights_to_cuda()
 
         if self.config["enable_cfg"]:
+            assert self.scheduler.sample_guide_scale is not None and self.scheduler.sample_guide_scale > 1.0, f"CFG requires sample_guide_scale > 1, got {self.scheduler.sample_guide_scale!r}"
             if self.config["cfg_parallel"]:
                 # ==================== CFG Parallel Processing ====================
                 cfg_p_group = self.config["device_mesh"].get_group(mesh_dim="cfg_p")

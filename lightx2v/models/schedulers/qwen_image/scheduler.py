@@ -1,4 +1,3 @@
-import functools
 import inspect
 import json
 import math
@@ -10,6 +9,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from loguru import logger
 from torch import nn
 from torch.nn import functional as F
 
@@ -231,10 +231,14 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-        self.rope_cache = {}
+        self.begin_request()
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
+
+    def begin_request(self):
+        self._request_video_cache_key = None
+        self._request_video_cache = None
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -260,33 +264,30 @@ class QwenEmbedRope(nn.Module):
         if not isinstance(video_fhw, list):
             video_fhw = [video_fhw]
 
-        vid_freqs = []
-        max_vid_index = 0
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
+        normalized_video_fhw = tuple(tuple(int(value) for value in fhw) for fhw in video_fhw)
+        device_key = (self.pos_freqs.device.type, self.pos_freqs.device.index)
+        cache_key = (normalized_video_fhw, device_key)
+        if self._request_video_cache_key != cache_key:
+            vid_freqs = []
+            max_vid_index = 0
+            for idx, (frame, height, width) in enumerate(normalized_video_fhw):
+                vid_freqs.append(self._compute_video_freqs(frame, height, width, idx))
 
-            if not torch.compiler.is_compiling():
-                if rope_key not in self.rope_cache:
-                    self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
-                video_freq = self.rope_cache[rope_key]
-            else:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
-            video_freq = video_freq.to(device)
-            vid_freqs.append(video_freq)
+                if self.scale_rope:
+                    max_vid_index = max(height // 2, width // 2, max_vid_index)
+                else:
+                    max_vid_index = max(height, width, max_vid_index)
 
-            if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
-            else:
-                max_vid_index = max(height, width, max_vid_index)
+            self._request_video_cache_key = cache_key
+            self._request_video_cache = (torch.cat(vid_freqs, dim=0), max_vid_index)
+
+        vid_freqs, max_vid_index = self._request_video_cache
 
         max_len = txt_seq_lens
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return [vid_freqs, txt_freqs]
 
-    @functools.lru_cache(maxsize=None)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -331,6 +332,11 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
 
         self.scale_rope = scale_rope
+        self.begin_request()
+
+    def begin_request(self):
+        self._request_video_cache_key = None
+        self._request_video_cache = None
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -356,33 +362,37 @@ class QwenEmbedLayer3DRope(nn.Module):
         if not isinstance(video_fhw, list):
             video_fhw = [video_fhw]
 
-        vid_freqs = []
-        max_vid_index = 0
-        layer_num = len(video_fhw) - 1
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            if idx != layer_num:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
-            else:
-                ### For the condition image, we set the layer index to -1
-                video_freq = self._compute_condition_freqs(frame, height, width)
-            video_freq = video_freq.to(device)
-            vid_freqs.append(video_freq)
+        normalized_video_fhw = tuple(tuple(int(value) for value in fhw) for fhw in video_fhw)
+        device_key = (self.pos_freqs.device.type, self.pos_freqs.device.index)
+        cache_key = (normalized_video_fhw, device_key)
+        if self._request_video_cache_key != cache_key:
+            vid_freqs = []
+            max_vid_index = 0
+            layer_num = len(normalized_video_fhw) - 1
+            for idx, (frame, height, width) in enumerate(normalized_video_fhw):
+                if idx != layer_num:
+                    video_freq = self._compute_video_freqs(frame, height, width, idx)
+                else:
+                    ### For the condition image, we set the layer index to -1
+                    video_freq = self._compute_condition_freqs(frame, height, width)
+                vid_freqs.append(video_freq)
 
-            if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
-            else:
-                max_vid_index = max(height, width, max_vid_index)
+                if self.scale_rope:
+                    max_vid_index = max(height // 2, width // 2, max_vid_index)
+                else:
+                    max_vid_index = max(height, width, max_vid_index)
 
-        max_vid_index = max(max_vid_index, layer_num)
+            max_vid_index = max(max_vid_index, layer_num)
+            self._request_video_cache_key = cache_key
+            self._request_video_cache = (torch.cat(vid_freqs, dim=0), max_vid_index)
+
+        vid_freqs, max_vid_index = self._request_video_cache
 
         max_len = txt_seq_lens
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
 
-    @functools.lru_cache(maxsize=None)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -401,7 +411,6 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @functools.lru_cache(maxsize=None)
     def _compute_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -435,6 +444,7 @@ class QwenImageScheduler(BaseScheduler):
         self.dtype = torch.bfloat16
         self.sample_guide_scale = self.config.get("sample_guide_scale", None)
         self.zero_cond_t = config.get("zero_cond_t", False)
+        self.rope_request_id = 0
         if self.config["seq_parallel"]:
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
         else:
@@ -507,9 +517,82 @@ class QwenImageScheduler(BaseScheduler):
         latents = latents.reshape(b, (height // 2) * (width // 2), num_channels_latents * 4)
         return latents
 
+    def _get_i2i_denoise_strength(self, input_info):
+        strength = getattr(input_info, "i2i_denoise_strength", None)
+        if strength is None:
+            return None
+        strength = float(strength)
+        if strength < 0.0 or strength > 1.0:
+            raise ValueError(f"The value of i2i_denoise_strength should be in [0.0, 1.0] but is {strength}")
+        return strength
+
+    def _get_single_i2i_image_latents(self, input_info):
+        image_encoder_output = getattr(input_info, "image_encoder_output", None)
+        if not image_encoder_output:
+            raise ValueError("i2i_denoise_strength requires exactly one input image with VAE image latents.")
+        if len(image_encoder_output) != 1:
+            raise ValueError(f"i2i_denoise_strength currently supports single-image editing only, got {len(image_encoder_output)} images.")
+        return image_encoder_output[0]["image_latents"]
+
+    def get_timesteps(self, num_inference_steps, strength, device):
+        target_steps = round(num_inference_steps * strength)
+        if target_steps < 1:
+            raise ValueError(
+                "i2i_denoise_strength results in 0 denoising steps: "
+                f"round(infer_steps * i2i_denoise_strength)=round({num_inference_steps} * {strength})={target_steps}; "
+                "please increase it to run at least 1 step."
+            )
+        t_start = num_inference_steps - target_steps
+        timesteps = self.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        return timesteps, target_steps
+
+    @staticmethod
+    def _unpack_packed_latents_to_4d(latents, height, width):
+        batch_size, _, channels = latents.shape
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        return latents.reshape(batch_size, channels // 4, height, width)
+
+    def _resize_i2i_image_latents(self, image_latents, target_height, target_width, num_channels_latents):
+        if image_latents.ndim != 3:
+            raise ValueError(f"Expected packed image latents with shape [B, L, C], got {tuple(image_latents.shape)}")
+
+        image_shapes = getattr(self.input_info, "image_shapes", None)
+        if image_shapes and image_shapes[0] and len(image_shapes[0]) >= 2:
+            _, source_patch_height, source_patch_width = image_shapes[0][1]
+            source_height, source_width = source_patch_height * 2, source_patch_width * 2
+        elif image_latents.shape[1] == (target_height // 2) * (target_width // 2):
+            source_height, source_width = target_height, target_width
+        else:
+            raise ValueError("Cannot infer source image latent shape for i2i_denoise_strength.")
+
+        image_latents = self._unpack_packed_latents_to_4d(image_latents, source_height, source_width)
+        if image_latents.shape[-2:] != (target_height, target_width):
+            image_latents = F.interpolate(image_latents, size=(target_height, target_width), mode="bilinear", align_corners=False)
+        return self._pack_latents(image_latents, image_latents.shape[0], num_channels_latents, target_height, target_width)
+
+    def prepare_i2i_denoise_strength_latents(self, input_info):
+        if self.is_layered:
+            raise ValueError("i2i_denoise_strength is only supported for non-layered qwen-image i2i.")
+
+        image_latents = self._get_single_i2i_image_latents(input_info).to(device=AI_DEVICE, dtype=self.dtype)
+        if self.latents.shape[0] != 1:
+            raise ValueError(f"i2i_denoise_strength currently supports single-image single-output editing only, got output latent batch {self.latents.shape[0]}.")
+
+        shape = input_info.latent_shape
+        target_height, target_width = shape[-2], shape[-1]
+        num_channels_latents = self.latents.shape[-1] // 4
+        image_latents = self._resize_i2i_image_latents(image_latents, target_height, target_width, num_channels_latents)
+
+        latent_timestep = self.timesteps[:1]
+        noise = self.latents
+        self.latents = self.scheduler.scale_noise(image_latents, latent_timestep, noise)
+
     def prepare_latents(self, input_info):
         self.input_info = input_info
-        shape = input_info.target_shape
+        shape = input_info.latent_shape
         # shape: [B, T, C, H, W]
         width, height = shape[-1], shape[-2]
         num_channels_latents = self.config.get("num_channels_latents", 16)
@@ -567,52 +650,56 @@ class QwenImageScheduler(BaseScheduler):
         self.timesteps = timesteps
         self.infer_steps = num_inference_steps
 
+        if self.config["task"] == "i2i":
+            strength = self._get_i2i_denoise_strength(self.input_info)
+            if strength is not None:
+                timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, AI_DEVICE)
+                self.timesteps = timesteps
+                self.infer_steps = num_inference_steps
+
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
         self.num_warmup_steps = num_warmup_steps
 
     def prepare(self, input_info):
-        if self.config["task"] == "i2i":
-            self.generator = torch.Generator().manual_seed(input_info.seed)
-        elif self.config["task"] == "t2i":
-            self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
+        self.rope_request_id += 1
+        self.pos_embed.begin_request()
+
+        if self.generator is None:
+            if self.config["task"] == "i2i":
+                self.generator = torch.Generator().manual_seed(input_info.seed)
+            elif self.config["task"] == "t2i":
+                self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
+        else:
+            logger.info(f"Generator is not None, using existing generator for latents")
         self.prepare_latents(input_info)
         self.set_timesteps()
+        strength = self._get_i2i_denoise_strength(input_info)
+        if self.config["task"] == "i2i" and strength is not None:
+            self.prepare_i2i_denoise_strength_latents(input_info)
 
-        self.image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[0], device=AI_DEVICE)
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            cos_half_img = self.image_rotary_emb[0].real.contiguous()
-            sin_half_img = self.image_rotary_emb[0].imag.contiguous()
-            cos_half_txt = self.image_rotary_emb[1].real.contiguous()
-            sin_half_txt = self.image_rotary_emb[1].imag.contiguous()
-            self.image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-            self.image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
+        image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[0], device=AI_DEVICE)
+        shared_img_freqs = image_rotary_emb[0]
         if self.seq_p_group is not None:
             world_size = dist.get_world_size(self.seq_p_group)
             cur_rank = dist.get_rank(self.seq_p_group)
-            seqlen = self.image_rotary_emb[0].shape[0]
+            seqlen = shared_img_freqs.shape[0]
             padding_size = (world_size - (seqlen % world_size)) % world_size
             if padding_size > 0:
-                self.image_rotary_emb[0] = F.pad(self.image_rotary_emb[0], (0, 0, 0, padding_size))
-            self.image_rotary_emb[0] = torch.chunk(self.image_rotary_emb[0], world_size, dim=0)[cur_rank]
+                shared_img_freqs = F.pad(shared_img_freqs, (0, 0, 0, padding_size))
+            shared_img_freqs = torch.chunk(shared_img_freqs, world_size, dim=0)[cur_rank]
+
+        if isinstance(image_rotary_emb, list):
+            self.image_rotary_emb = [shared_img_freqs, image_rotary_emb[1]]
+        else:
+            self.image_rotary_emb = (shared_img_freqs, image_rotary_emb[1])
 
         if self.config["enable_cfg"]:
-            self.negative_image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[1], device=AI_DEVICE)
-            if self.config.get("rope_type", "flashinfer") == "flashinfer":
-                cos_half_img = self.negative_image_rotary_emb[0].real.contiguous()
-                sin_half_img = self.negative_image_rotary_emb[0].imag.contiguous()
-                cos_half_txt = self.negative_image_rotary_emb[1].real.contiguous()
-                sin_half_txt = self.negative_image_rotary_emb[1].imag.contiguous()
-                self.negative_image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-                self.negative_image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = self.negative_image_rotary_emb[0].shape[0]
-                padding_size = (world_size - (seqlen % world_size)) % world_size
-                if padding_size > 0:
-                    self.negative_image_rotary_emb[0] = F.pad(self.negative_image_rotary_emb[0], (0, 0, 0, padding_size))
-                self.negative_image_rotary_emb[0] = torch.chunk(self.negative_image_rotary_emb[0], world_size, dim=0)[cur_rank]
+            negative_image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[1], device=AI_DEVICE)
+            if isinstance(negative_image_rotary_emb, list):
+                self.negative_image_rotary_emb = [shared_img_freqs, negative_image_rotary_emb[1]]
+            else:
+                self.negative_image_rotary_emb = (shared_img_freqs, negative_image_rotary_emb[1])
 
         if self.zero_cond_t:
             self.modulate_index = torch.tensor([[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in self.input_info.image_shapes], device=AI_DEVICE, dtype=torch.int)
@@ -626,6 +713,27 @@ class QwenImageScheduler(BaseScheduler):
                 self.modulate_index = torch.chunk(self.modulate_index, world_size, dim=1)[cur_rank]
         else:
             self.modulate_index = None
+
+    def clear(self):
+        for name in (
+            "generator",
+            "latents",
+            "latent_image_ids",
+            "noise_pred",
+            "timesteps",
+            "timesteps_proj",
+            "image_rotary_emb",
+            "negative_image_rotary_emb",
+            "modulate_index",
+            "input_info",
+        ):
+            setattr(self, name, None)
+        self.step_index = 0
+        self.infer_condition = True
+        self.pos_embed.begin_request()
+
+        self.scheduler._step_index = None
+        self.scheduler._begin_index = None
 
     def step_pre(self, step_index):
         super().step_pre(step_index)

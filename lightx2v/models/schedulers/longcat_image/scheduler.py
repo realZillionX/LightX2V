@@ -6,6 +6,8 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from torch import nn
 
@@ -267,6 +269,28 @@ class LongCatImageScheduler(BaseScheduler):
         else:
             self.seq_p_group = None
 
+    def _seq_parallel_rope(self, rotary_emb, txt_seq_len):
+        if self.seq_p_group is None:
+            return rotary_emb
+
+        world_size = dist.get_world_size(self.seq_p_group)
+        cur_rank = dist.get_rank(self.seq_p_group)
+
+        def chunk_image_emb(image_emb):
+            seqlen = image_emb.shape[0]
+            padding_size = (world_size - (seqlen % world_size)) % world_size
+            if padding_size > 0:
+                image_emb = F.pad(image_emb, (0, 0, 0, padding_size))
+            return torch.chunk(image_emb, world_size, dim=0)[cur_rank]
+
+        freqs_cos, freqs_sin = rotary_emb
+        txt_cos, img_cos = freqs_cos[:txt_seq_len], freqs_cos[txt_seq_len:]
+        txt_sin, img_sin = freqs_sin[:txt_seq_len], freqs_sin[txt_seq_len:]
+        return (
+            torch.cat([txt_cos, chunk_image_emb(img_cos)], dim=0),
+            torch.cat([txt_sin, chunk_image_emb(img_sin)], dim=0),
+        )
+
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels, height, width):
         """Pack latents from [B, C, H, W] to [B, (H//2)*(W//2), C*4] for transformer input.
@@ -285,9 +309,8 @@ class LongCatImageScheduler(BaseScheduler):
     def prepare_latents(self, input_info):
         """Prepare random latents for denoising."""
         self.input_info = input_info
-        shape = input_info.target_shape
-        # target_shape is already in latent space: (B, C, H, W)
-        # where C=16 (VAE latent channels), H and W are latent dimensions
+        shape = input_info.latent_shape
+        # C=16 (VAE latent channels); H and W are latent dimensions.
         vae_latent_channels = shape[1]  # 16
         latent_height = shape[-2]
         latent_width = shape[-1]
@@ -355,15 +378,8 @@ class LongCatImageScheduler(BaseScheduler):
         ids = torch.cat([txt_ids, img_ids], dim=0).to(AI_DEVICE, dtype=torch.float32)
         freqs_cos, freqs_sin = self.pos_embed(ids)
 
-        # Convert to flashinfer format if needed
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            # pos_embed returns interleaved format: [c0, c0, c1, c1, ...]
-            # flashinfer needs: [c0, c1, ..., s0, s1, ...]
-            cos_half = freqs_cos[:, ::2].contiguous()  # [L, D/2]
-            sin_half = freqs_sin[:, ::2].contiguous()  # [L, D/2]
-            self.image_rotary_emb = torch.cat([cos_half, sin_half], dim=-1)  # [L, D]
-        else:
-            self.image_rotary_emb = (freqs_cos, freqs_sin)
+        self.image_rotary_emb = (freqs_cos, freqs_sin)
+        self.image_rotary_emb = self._seq_parallel_rope(self.image_rotary_emb, txt_seq_len)
 
         # Handle CFG: prepare negative embeddings rotary
         if self.config.get("enable_cfg", True):
@@ -372,12 +388,8 @@ class LongCatImageScheduler(BaseScheduler):
             neg_ids = torch.cat([neg_txt_ids, img_ids], dim=0).to(AI_DEVICE, dtype=torch.float32)
             neg_freqs_cos, neg_freqs_sin = self.pos_embed(neg_ids)
 
-            if self.config.get("rope_type", "flashinfer") == "flashinfer":
-                neg_cos_half = neg_freqs_cos[:, ::2].contiguous()
-                neg_sin_half = neg_freqs_sin[:, ::2].contiguous()
-                self.negative_image_rotary_emb = torch.cat([neg_cos_half, neg_sin_half], dim=-1)
-            else:
-                self.negative_image_rotary_emb = (neg_freqs_cos, neg_freqs_sin)
+            self.negative_image_rotary_emb = (neg_freqs_cos, neg_freqs_sin)
+            self.negative_image_rotary_emb = self._seq_parallel_rope(self.negative_image_rotary_emb, neg_txt_seq_len)
 
     def step_pre(self, step_index):
         """Prepare for a single denoising step."""
@@ -431,13 +443,8 @@ class LongCatImageScheduler(BaseScheduler):
         ids = torch.cat([txt_ids, combined_img_ids], dim=0).to(AI_DEVICE, dtype=torch.float32)
         freqs_cos, freqs_sin = self.pos_embed(ids)
 
-        # Convert to flashinfer format if needed
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            cos_half = freqs_cos[:, ::2].contiguous()
-            sin_half = freqs_sin[:, ::2].contiguous()
-            self.image_rotary_emb = torch.cat([cos_half, sin_half], dim=-1)
-        else:
-            self.image_rotary_emb = (freqs_cos, freqs_sin)
+        self.image_rotary_emb = (freqs_cos, freqs_sin)
+        self.image_rotary_emb = self._seq_parallel_rope(self.image_rotary_emb, txt_seq_len)
 
         # Store output sequence length for later truncation
         self.output_seq_len = self.latents.shape[1]
@@ -449,12 +456,8 @@ class LongCatImageScheduler(BaseScheduler):
             neg_ids = torch.cat([neg_txt_ids, combined_img_ids], dim=0).to(AI_DEVICE, dtype=torch.float32)
             neg_freqs_cos, neg_freqs_sin = self.pos_embed(neg_ids)
 
-            if self.config.get("rope_type", "flashinfer") == "flashinfer":
-                neg_cos_half = neg_freqs_cos[:, ::2].contiguous()
-                neg_sin_half = neg_freqs_sin[:, ::2].contiguous()
-                self.negative_image_rotary_emb = torch.cat([neg_cos_half, neg_sin_half], dim=-1)
-            else:
-                self.negative_image_rotary_emb = (neg_freqs_cos, neg_freqs_sin)
+            self.negative_image_rotary_emb = (neg_freqs_cos, neg_freqs_sin)
+            self.negative_image_rotary_emb = self._seq_parallel_rope(self.negative_image_rotary_emb, neg_txt_seq_len)
 
     def _encode_image(self, image):
         """Encode input image using VAE.

@@ -17,6 +17,7 @@ except ImportError:
 from lightx2v.models.input_encoders.hf.animate.face_encoder import FaceEncoder
 from lightx2v.models.input_encoders.hf.animate.motion_encoder import Generator
 from lightx2v.models.networks.wan.animate_model import WanAnimateModel
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
 from lightx2v.models.runners.wan.wan_runner import WanRunner, build_wan_model_with_lora
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
@@ -28,6 +29,23 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 @RUNNER_REGISTER("wan2.2_animate")
 class WanAnimateRunner(WanRunner):
+    supported_request_fields_by_task = {
+        "animate": COMMON_REQUEST_FIELDS
+        | PROMPT_FIELDS
+        | {
+            "face_video_path",
+            "pose_video_path",
+            "ref_image_paths",
+            "num_frames",
+        },
+    }
+
+    def get_supported_request_fields(self, task):
+        supported_request_fields = super().get_supported_request_fields(task)
+        if self.config.get("replace_flag", False):
+            return supported_request_fields | {"mask_path", "background_video_path"}
+        return supported_request_fields
+
     def __init__(self, config):
         super().__init__(config)
         assert self.config["task"] == "animate"
@@ -56,7 +74,7 @@ class WanAnimateRunner(WanRunner):
         target_len = real_len + extra
         return target_len
 
-    def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
+    def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device=AI_DEVICE):
         if mask_pixel_values is None:
             msk = torch.zeros(1, (lat_t - 1) * 4 + 1, lat_h, lat_w, dtype=GET_DTYPE(), device=device)
         else:
@@ -106,23 +124,71 @@ class WanAnimateRunner(WanRunner):
 
         return img_pad
 
-    def prepare_source(self, src_pose_path, src_face_path, src_ref_path):
-        pose_video_reader = VideoReader(src_pose_path)
+    def use_auto_target_shape(self):
+        return self.config.get("auto_target_shape", True)
+
+    def align_target_shape(self, height, width):
+        height = (int(height) // 16) * 16
+        width = (int(width) // 16) * 16
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid WanAnimate target shape: height={height}, width={width}")
+        return height, width
+
+    def get_comfy_target_shape(self):
+        return self.align_target_shape(self.config["size"][0], self.config["size"][1])
+
+    def center_crop_to_aspect(self, img, height, width):
+        ori_height, ori_width = img.shape[:2]
+        target_aspect = width / height
+        ori_aspect = ori_width / ori_height
+        if ori_aspect > target_aspect:
+            crop_width = max(1, round(ori_height * target_aspect))
+            x0 = max(0, (ori_width - crop_width) // 2)
+            img = img[:, x0 : x0 + crop_width]
+        elif ori_aspect < target_aspect:
+            crop_height = max(1, round(ori_width / target_aspect))
+            y0 = max(0, (ori_height - crop_height) // 2)
+            img = img[y0 : y0 + crop_height]
+        return img
+
+    def comfy_resize(self, img, height, width, interpolation=cv2.INTER_LANCZOS4, crop=None):
+        if crop == "center":
+            img = self.center_crop_to_aspect(img, height=height, width=width)
+        if img.shape[0] == height and img.shape[1] == width:
+            return img
+        return cv2.resize(img, (width, height), interpolation=interpolation)
+
+    def comfy_resize_frames(self, frames, height, width, interpolation=cv2.INTER_LANCZOS4, crop=None):
+        return np.stack([self.comfy_resize(frame, height, width, interpolation=interpolation, crop=crop) for frame in frames])
+
+    def prepare_source(self, pose_video_path, face_video_path, src_ref_path):
+        pose_video_reader = VideoReader(pose_video_path)
         pose_len = len(pose_video_reader)
         pose_idxs = list(range(pose_len))
         cond_images = pose_video_reader.get_batch(pose_idxs).asnumpy()
 
-        face_video_reader = VideoReader(src_face_path)
+        face_video_reader = VideoReader(face_video_path)
         face_len = len(face_video_reader)
         face_idxs = list(range(face_len))
         face_images = face_video_reader.get_batch(face_idxs).asnumpy()
         height, width = cond_images[0].shape[:2]
         refer_images = cv2.imread(src_ref_path)[..., ::-1]
-        refer_images = self.padding_resize(refer_images, height=height, width=width)
+        if self.use_auto_target_shape():
+            target_height, target_width = self.align_target_shape(height, width)
+            logger.info(f"WanAnimate uses auto target shape: height={target_height}, width={target_width}")
+            cond_images = self.comfy_resize_frames(cond_images, target_height, target_width)
+            refer_images = self.padding_resize(refer_images, height=target_height, width=target_width)
+        else:
+            target_height, target_width = self.get_comfy_target_shape()
+            logger.info(f"WanAnimate uses config target shape: height={target_height}, width={target_width}")
+            cond_images = self.comfy_resize_frames(cond_images, target_height, target_width)
+            refer_images = self.comfy_resize(refer_images, target_height, target_width)
+            face_images = self.comfy_resize_frames(face_images, 512, 512, crop="center")
+        self.animate_target_shape = (target_height, target_width)
         return cond_images, face_images, refer_images
 
-    def prepare_source_for_replace(self, src_bg_path, src_mask_path):
-        bg_video_reader = VideoReader(src_bg_path)
+    def prepare_source_for_replace(self, background_video_path, src_mask_path):
+        bg_video_reader = VideoReader(background_video_path)
         bg_len = len(bg_video_reader)
         bg_idxs = list(range(bg_len))
         bg_images = bg_video_reader.get_batch(bg_idxs).asnumpy()
@@ -132,6 +198,12 @@ class WanAnimateRunner(WanRunner):
         mask_idxs = list(range(mask_len))
         mask_images = mask_video_reader.get_batch(mask_idxs).asnumpy()
         mask_images = mask_images[:, :, :, 0] / 255
+        if self.use_auto_target_shape():
+            target_height, target_width = getattr(self, "animate_target_shape", self.align_target_shape(*bg_images[0].shape[:2]))
+        else:
+            target_height, target_width = self.get_comfy_target_shape()
+        bg_images = self.comfy_resize_frames(bg_images, target_height, target_width)
+        mask_images = self.comfy_resize_frames(mask_images, target_height, target_width, interpolation=cv2.INTER_NEAREST)
         return bg_images, mask_images
 
     @ProfilingContext4DebugL2("Run Image Encoders")
@@ -206,7 +278,7 @@ class WanAnimateRunner(WanRunner):
                                 size=(H, W),
                                 mode="bicubic",
                             ),
-                            torch.zeros(3, self.config["target_video_length"] - self.mask_reft_len, H, W, dtype=GET_DTYPE()),
+                            torch.zeros(3, self.get_num_frames() - self.mask_reft_len, H, W, dtype=GET_DTYPE()),
                         ],
                         dim=1,
                     )
@@ -229,7 +301,7 @@ class WanAnimateRunner(WanRunner):
                     mask_pixel_values=mask_pixel_values.unsqueeze(0),
                 )
             else:
-                y_reft = self.vae_encoder.encode(torch.zeros(1, 3, self.config["target_video_length"] - self.mask_reft_len, H, W, dtype=GET_DTYPE(), device="cuda"))
+                y_reft = self.vae_encoder.encode(torch.zeros(1, 3, self.get_num_frames() - self.mask_reft_len, H, W, dtype=GET_DTYPE(), device=AI_DEVICE))
                 msk_reft = self.get_i2v_mask(self.latent_t, self.latent_h, self.latent_w, self.mask_reft_len)
 
         y_reft = torch.concat([msk_reft, y_reft])
@@ -238,19 +310,20 @@ class WanAnimateRunner(WanRunner):
         return y, pose_latents
 
     def prepare_input(self):
-        src_pose_path = self.input_info.src_pose_path
-        src_face_path = self.input_info.src_face_path
-        src_ref_path = self.input_info.src_ref_images
-        self.cond_images, self.face_images, self.refer_images = self.prepare_source(src_pose_path, src_face_path, src_ref_path)
-        self.refer_pixel_values = torch.tensor(self.refer_images / 127.5 - 1, dtype=GET_DTYPE(), device="cuda").permute(2, 0, 1)  # chw
-        self.latent_t = self.config["target_video_length"] // self.config["vae_stride"][0] + 1
+        pose_video_path = self.input_info.pose_video_path
+        face_video_path = self.input_info.face_video_path
+        src_ref_path = self.input_info.ref_image_paths
+        self.cond_images, self.face_images, self.refer_images = self.prepare_source(pose_video_path, face_video_path, src_ref_path)
+        self.refer_pixel_values = torch.tensor(self.refer_images / 127.5 - 1, dtype=GET_DTYPE(), device=AI_DEVICE).permute(2, 0, 1)  # chw
+        num_frames = self.get_num_frames()
+        self.latent_t = num_frames // self.config["vae_stride"][0] + 1
         self.latent_h = self.refer_pixel_values.shape[-2] // self.config["vae_stride"][1]
         self.latent_w = self.refer_pixel_values.shape[-1] // self.config["vae_stride"][2]
         self.input_info.latent_shape = [self.config.get("num_channels_latents", 16), self.latent_t + 1, self.latent_h, self.latent_w]
         self.real_frame_len = len(self.cond_images)
         target_len = self.get_valid_len(
             self.real_frame_len,
-            self.config["target_video_length"],
+            num_frames,
             overlap=self.config["refert_num"] if "refert_num" in self.config else 1,
         )
         logger.info("real frames: {} target frames: {}".format(self.real_frame_len, target_len))
@@ -258,19 +331,20 @@ class WanAnimateRunner(WanRunner):
         self.face_images = self.inputs_padding(self.face_images, target_len)
 
         if self.config["replace_flag"] if "replace_flag" in self.config else False:
-            src_bg_path = self.input_info.src_bg_path
-            src_mask_path = self.input_info.src_mask_path
-            self.bg_images, self.mask_images = self.prepare_source_for_replace(src_bg_path, src_mask_path)
+            background_video_path = self.input_info.background_video_path
+            src_mask_path = self.input_info.mask_path
+            self.bg_images, self.mask_images = self.prepare_source_for_replace(background_video_path, src_mask_path)
             self.bg_images = self.inputs_padding(self.bg_images, target_len)
             self.mask_images = self.inputs_padding(self.mask_images, target_len)
 
     def get_video_segment_num(self):
         total_frames = len(self.cond_images)
-        self.move_frames = self.config["target_video_length"] - self.config["refert_num"]
-        if total_frames <= self.config["target_video_length"]:
+        num_frames = self.get_num_frames()
+        self.move_frames = num_frames - self.config["refert_num"]
+        if total_frames <= num_frames:
             self.video_segment_num = 1
         else:
-            self.video_segment_num = 1 + (total_frames - self.config["target_video_length"] + self.move_frames - 1) // self.move_frames
+            self.video_segment_num = 1 + (total_frames - num_frames + self.move_frames - 1) // self.move_frames
 
     def init_run(self):
         self.all_out_frames = []
@@ -301,7 +375,7 @@ class WanAnimateRunner(WanRunner):
     )
     def init_run_segment(self, segment_idx):
         start = segment_idx * self.move_frames
-        end = start + self.config["target_video_length"]
+        end = start + self.get_num_frames()
         if start == 0:
             self.mask_reft_len = 0
         else:
@@ -309,13 +383,13 @@ class WanAnimateRunner(WanRunner):
 
         conditioning_pixel_values = torch.tensor(
             np.stack(self.cond_images[start:end]) / 127.5 - 1,
-            device="cuda",
+            device=AI_DEVICE,
             dtype=GET_DTYPE(),
         ).permute(3, 0, 1, 2)  # c t h w
 
         face_pixel_values = torch.tensor(
             np.stack(self.face_images[start:end]) / 127.5 - 1,
-            device="cuda",
+            device=AI_DEVICE,
             dtype=GET_DTYPE(),
         ).permute(0, 3, 1, 2)  # thwc->tchw
 
@@ -326,7 +400,7 @@ class WanAnimateRunner(WanRunner):
                 self.config["refert_num"],
                 height,
                 width,
-                device="cuda",
+                device=AI_DEVICE,
                 dtype=GET_DTYPE(),
             )  # c t h w
         else:
@@ -336,13 +410,13 @@ class WanAnimateRunner(WanRunner):
         if self.config["replace_flag"] if "replace_flag" in self.config else False:
             bg_pixel_values = torch.tensor(
                 np.stack(self.bg_images[start:end]) / 127.5 - 1,
-                device="cuda",
+                device=AI_DEVICE,
                 dtype=GET_DTYPE(),
             ).permute(3, 0, 1, 2)  # c t h w,
 
             mask_pixel_values = torch.tensor(
                 np.stack(self.mask_images[start:end])[:, :, :, None],
-                device="cuda",
+                device=AI_DEVICE,
                 dtype=GET_DTYPE(),
             ).permute(3, 0, 1, 2)  # c t h w,
 
@@ -368,7 +442,7 @@ class WanAnimateRunner(WanRunner):
         self.gen_video_final = torch.cat(self.all_out_frames, dim=2)[:, :, : self.real_frame_len]
         del self.all_out_frames
         gc.collect()
-        super().process_images_after_vae_decoder()
+        return super().process_images_after_vae_decoder()
 
     @ProfilingContext4DebugL1(
         "Run Image Encoder",

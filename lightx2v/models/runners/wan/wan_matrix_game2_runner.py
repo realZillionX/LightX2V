@@ -7,6 +7,7 @@ from torchvision.transforms import v2
 from lightx2v.models.input_encoders.hf.wan.matrix_game2.clip import CLIPModel
 from lightx2v.models.input_encoders.hf.wan.matrix_game2.conditions import Bench_actions_gta_drive, Bench_actions_templerun, Bench_actions_universal
 from lightx2v.models.networks.wan.matrix_game2_model import WanSFMtxg2Model
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.runners.wan.wan_sf_runner import WanSFRunner
 from lightx2v.models.video_encoders.hf.wan.vae_sf import WanMtxg2VAE
 from lightx2v.server.metrics import monitor_cli
@@ -152,6 +153,10 @@ def get_current_action(mode="universal"):
 
 @RUNNER_REGISTER("wan2.1_sf_mtxg2")
 class WanSFMtxg2Runner(WanSFRunner):
+    supported_request_fields_by_task = {
+        "i2v": COMMON_REQUEST_FIELDS | {"image_path"},
+    }
+
     def __init__(self, config):
         super().__init__(config)
         self.frame_process = v2.Compose(
@@ -242,43 +247,6 @@ class WanSFMtxg2Runner(WanSFRunner):
             self.inputs["current_actions"] = get_current_action(mode=self.config["mode"])
 
     @ProfilingContext4DebugL2("Run DiT")
-    def run_main(self):
-        self.init_run()
-        if self.config.get("compile", False):
-            self.model.select_graph_for_compile(self.input_info)
-
-        stop = ""
-        while stop != "n":
-            for segment_idx in range(self.video_segment_num):
-                logger.info(f"🔄 start segment {segment_idx + 1}/{self.video_segment_num}")
-                with ProfilingContext4DebugL1(
-                    f"segment end2end {segment_idx + 1}/{self.video_segment_num}",
-                    recorder_mode=GET_RECORDER_MODE(),
-                    metrics_func=monitor_cli.lightx2v_run_segments_end2end_duration,
-                    metrics_labels=["DefaultRunner"],
-                ):
-                    self.check_stop()
-                    # 1. default do nothing
-                    self.init_run_segment(segment_idx)
-                    # 2. main inference loop
-                    latents = self.run_segment(segment_idx=segment_idx)
-                    # 3. vae decoder
-                    self.gen_video = self.run_vae_decoder(latents)
-                    # 4. default do nothing
-                    self.end_run_segment(segment_idx)
-
-                # 5. stop or not
-                if self.config["streaming"]:
-                    stop = input("Press `n` to stop generation: ").strip().lower()
-                    if stop == "n":
-                        break
-            stop = "n"
-
-        gen_video_final = self.process_images_after_vae_decoder()
-        self.end_run()
-        return gen_video_final
-
-    @ProfilingContext4DebugL2("Run DiT")
     def run_main_live(self, total_steps=None):
         try:
             self.init_video_recorder()
@@ -290,9 +258,6 @@ class WanSFMtxg2Runner(WanSFRunner):
             if world_size > 1:
                 dist.barrier()
             self.init_run()
-            if self.config.get("compile", False):
-                self.model.select_graph_for_compile(self.input_info)
-
             stop = ""
             while stop != "n":
                 for segment_idx in range(self.video_segment_num):

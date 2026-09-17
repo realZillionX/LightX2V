@@ -1,20 +1,21 @@
+import os
+
 import torch
 import torch.nn.functional as F
+from loguru import logger
 
+from lightx2v.common.magi_custom_op_mode import configure_dynamo_for_magi_compile, set_magi_custom_op_mode
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 
 from .triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
 )
-from .utils import apply_qwen_rope_with_flashinfer, apply_qwen_rope_with_torch, apply_qwen_rope_with_torch_naive
 
-
-def calculate_q_k_len(q, k_lens):
-    q_lens = torch.tensor([q.size(0)], dtype=torch.int32)
-    cu_seqlens_q = torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32)
-    cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32)
-    return cu_seqlens_q, cu_seqlens_k
+try:
+    from magi_compiler import magi_compile
+except ImportError:
+    magi_compile = None
 
 
 class QwenImageTransformerInfer(BaseTransformerInfer):
@@ -22,10 +23,22 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         self.config = config
         self.infer_conditional = True
         self.clean_cuda_cache = self.config.get("clean_cuda_cache", False)
+        self.init_compile(config)
+
+        self.use_magi_compile = config.get("use_magi_compile", False)
+        if self.use_magi_compile and magi_compile is None:
+            logger.warning("use_magi_compile=True but magi_compiler is not available, using eager mode")
+            self.use_magi_compile = False
+        set_magi_custom_op_mode(self.use_magi_compile)
+        if self.use_magi_compile:
+            configure_dynamo_for_magi_compile()
+            logger.info("Using Magi Compile (split: pre-attn / cross-attn eager / post-attn)")
         self.infer_func = self.infer_calculating
+
         self.attn_type = config.get("attn_type", "flash_attn3")
         self.zero_cond_t = config.get("zero_cond_t", False)
-        if self.config["seq_parallel"]:
+        self.seq_parallel = config["seq_parallel"]
+        if self.seq_parallel:
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
             self.seq_p_fp8_comm = self.config["parallel"].get("seq_p_fp8_comm", False)
             self.seq_p_fp4_comm = self.config["parallel"].get("seq_p_fp4_comm", False)
@@ -35,18 +48,11 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
             self.seq_p_fp8_comm = False
             self.seq_p_fp4_comm = False
             self.enable_head_parallel = False
-        if self.config.get("modulate_type", "triton") == "triton":
+        self.use_triton_modulate = config.get("modulate_type", "triton") == "triton"
+        if self.use_triton_modulate:
             self.modulate_func = fuse_scale_shift_kernel
         else:
             self.modulate_func = lambda x, scale, shift: x * (1 + scale) + shift
-        rope_funcs = {
-            "flashinfer": apply_qwen_rope_with_flashinfer,
-            "torch": apply_qwen_rope_with_torch,
-            "torch_naive": apply_qwen_rope_with_torch_naive,
-        }
-        rope_type = config.get("rope_type", "flashinfer")
-        self.apply_rope_func = rope_funcs.get(rope_type, apply_qwen_rope_with_torch)
-
         self.img_qkv_len1 = None
         self.cu_seqlens_qkv1 = None
         self.img_qkv_len2 = None
@@ -71,7 +77,7 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
             scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
             gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
 
-            if self.config.get("modulate_type", "triton") == "triton":
+            if self.use_triton_modulate:
                 x, gate_result = fuse_scale_shift_gate_select01_kernel(
                     x,
                     scale0=scale_0,
@@ -95,41 +101,13 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
             gate_result = gate.unsqueeze(0)
             return self.modulate_func(x, scale_result, shift_result).squeeze(0), gate_result.squeeze(0)
 
-    def infer_modulate(
-        self,
-        mod_phase,
-        hidden_states,
-        encoder_hidden_states,
-        temb_img_silu,
-        temb_txt_silu,
-        modulate_index=None,
-    ):
-        # Get modulation parameters for both streams
-        img_mod_params = mod_phase.img_mod.apply(temb_img_silu)
-
-        txt_mod_params = mod_phase.txt_mod.apply(temb_txt_silu)
-
-        # Split modulation parameters for norm1 and norm2
-        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
-
-        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
-
-        # Process image stream - norm1 + modulation
-        img_normed = mod_phase.img_norm1.apply(hidden_states)
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
-
-        # Process text stream - norm1 + modulation
-        txt_normed = mod_phase.txt_norm1.apply(encoder_hidden_states)
-        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
-
-        return img_modulated, txt_modulated, img_gate1, txt_gate1, img_mod2, txt_mod2
-
     def infer_img_qkv(
         self,
         img_attn_phase,
         hidden_states,
         temb_img_silu,
         img_freqs,
+        img_positions,
         modulate_index=None,
     ):
         img_mod_params = img_attn_phase.img_mod.apply(temb_img_silu)
@@ -151,12 +129,14 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         if img_attn_phase.norm_k is not None:
             img_key = img_attn_phase.norm_k.apply(img_key)
 
-        img_query, img_key = self.apply_rope_func(img_query, img_key, img_freqs)
+        if img_positions is None:
+            img_query, img_key = img_attn_phase.rope.apply(img_query, img_key, img_freqs)
+        else:
+            img_query, img_key = img_attn_phase.rope.apply(img_query, img_key, img_freqs, positions=img_positions)
 
         return img_query, img_key, img_value, img_gate1, img_mod2
 
-    def infer_txt_qkv(self, txt_attn_phase, encoder_hidden_states, temb_txt_silu, txt_freqs):
-        # Get sequence length from text hidden states
+    def infer_txt_qkv(self, txt_attn_phase, encoder_hidden_states, temb_txt_silu, txt_freqs, txt_positions):
         seq_txt = encoder_hidden_states.shape[0]
 
         txt_mod_params = txt_attn_phase.txt_mod.apply(temb_txt_silu)
@@ -179,7 +159,10 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         if txt_attn_phase.norm_added_k is not None:
             txt_key = txt_attn_phase.norm_added_k.apply(txt_key)
 
-        txt_query, txt_key = self.apply_rope_func(txt_query, txt_key, txt_freqs)
+        if txt_positions is None:
+            txt_query, txt_key = txt_attn_phase.rope.apply(txt_query, txt_key, txt_freqs)
+        else:
+            txt_query, txt_key = txt_attn_phase.rope.apply(txt_query, txt_key, txt_freqs, positions=txt_positions)
 
         return txt_query, txt_key, txt_value, seq_txt, txt_gate1, txt_mod2
 
@@ -198,8 +181,6 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         hidden_states,
         encoder_hidden_states,
     ):
-        # Concatenate for joint attention
-        # Order: [text, image]
         joint_query = torch.cat([txt_query, img_query], dim=0)
         joint_key = torch.cat([txt_key, img_key], dim=0)
         joint_value = torch.cat([txt_value, img_value], dim=0)
@@ -207,7 +188,7 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         img_qkv_len = joint_query.shape[0]
         cu_seqlens_qkv = torch.tensor([0, img_qkv_len], dtype=torch.int32, device="cpu")
 
-        if self.config["seq_parallel"]:
+        if self.seq_parallel:
             joint_hidden_states = cross_attn_phase.calculate_parallel.apply(
                 q=joint_query,
                 k=joint_key,
@@ -232,9 +213,8 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
                 max_seqlen_kv=img_qkv_len,
             )
 
-        # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:seq_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[seq_txt:, :]  # Image part
+        txt_attn_output = joint_hidden_states[:seq_txt, :]
+        img_attn_output = joint_hidden_states[seq_txt:, :]
 
         # Apply output projections
         img_attn_output = cross_attn_phase.to_out.apply(img_attn_output)
@@ -278,6 +258,70 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
 
         return encoder_hidden_states, hidden_states
 
+    def infer_block_pre_attn(
+        self,
+        img_attn_phase,
+        txt_attn_phase,
+        hidden_states,
+        encoder_hidden_states,
+        temb_img_silu,
+        temb_txt_silu,
+        img_freqs,
+        txt_freqs,
+        img_positions,
+        txt_positions,
+        modulate_index=None,
+    ):
+        """Norm1 + modulate + QKV (+ RoPE); hidden_states unchanged for cross-attn residual."""
+        img_query, img_key, img_value, img_gate1, img_mod2 = self.infer_img_qkv(
+            img_attn_phase=img_attn_phase,
+            hidden_states=hidden_states,
+            temb_img_silu=temb_img_silu,
+            img_freqs=img_freqs,
+            img_positions=img_positions,
+            modulate_index=modulate_index,
+        )
+
+        txt_query, txt_key, txt_value, _, txt_gate1, txt_mod2 = self.infer_txt_qkv(
+            txt_attn_phase=txt_attn_phase,
+            encoder_hidden_states=encoder_hidden_states,
+            temb_txt_silu=temb_txt_silu,
+            txt_freqs=txt_freqs,
+            txt_positions=txt_positions,
+        )
+
+        return (
+            img_query,
+            img_key,
+            img_value,
+            txt_query,
+            txt_key,
+            txt_value,
+            img_gate1,
+            txt_gate1,
+            img_mod2,
+            txt_mod2,
+        )
+
+    def infer_block_post_attn(
+        self,
+        ffn_phase,
+        hidden_states,
+        encoder_hidden_states,
+        img_mod2,
+        txt_mod2,
+        modulate_index=None,
+    ):
+        """Norm2 + modulate + FFN after cross-attention."""
+        return self.infer_ffn(
+            ffn_phase=ffn_phase,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            img_mod2=img_mod2,
+            txt_mod2=txt_mod2,
+            modulate_index=modulate_index,
+        )
+
     def infer_block(
         self,
         block,
@@ -286,13 +330,63 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         temb_img_silu,
         temb_txt_silu,
         image_rotary_emb,
+        image_rotary_positions,
         modulate_index=None,
     ):
+        if self.use_magi_compile:
+            (
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+                img_gate1,
+                txt_gate1,
+                img_mod2,
+                txt_mod2,
+            ) = self.infer_block_pre_attn_magi(
+                img_attn_phase=block.compute_phases[0],
+                txt_attn_phase=block.compute_phases[1],
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_img_silu=temb_img_silu,
+                temb_txt_silu=temb_txt_silu,
+                img_freqs=image_rotary_emb[0],
+                txt_freqs=image_rotary_emb[1],
+                img_positions=image_rotary_positions[0],
+                txt_positions=image_rotary_positions[1],
+                modulate_index=modulate_index,
+            )
+            hidden_states, encoder_hidden_states = self.infer_cross_attn(
+                cross_attn_phase=block.compute_phases[2],
+                seq_txt=encoder_hidden_states.shape[0],
+                img_query=img_query,
+                img_key=img_key,
+                img_value=img_value,
+                txt_query=txt_query,
+                txt_key=txt_key,
+                txt_value=txt_value,
+                img_gate1=img_gate1,
+                txt_gate1=txt_gate1,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+            return self.infer_block_post_attn_magi(
+                ffn_phase=block.compute_phases[3],
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                img_mod2=img_mod2,
+                txt_mod2=txt_mod2,
+                modulate_index=modulate_index,
+            )
+
         img_query, img_key, img_value, img_gate1, img_mod2 = self.infer_img_qkv(
             img_attn_phase=block.compute_phases[0],
             hidden_states=hidden_states,
             temb_img_silu=temb_img_silu,
             img_freqs=image_rotary_emb[0],
+            img_positions=image_rotary_positions[0],
             modulate_index=modulate_index,
         )
 
@@ -301,6 +395,7 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
             encoder_hidden_states=encoder_hidden_states,
             temb_txt_silu=temb_txt_silu,
             txt_freqs=image_rotary_emb[1],
+            txt_positions=image_rotary_positions[1],
         )
 
         hidden_states, encoder_hidden_states = self.infer_cross_attn(
@@ -337,19 +432,112 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         temb_img_silu,
         temb_txt_silu,
         image_rotary_emb,
+        image_rotary_positions,
         modulate_index,
     ):
-        for idx in range(len(blocks)):
-            encoder_hidden_states, hidden_states = self.infer_block(
-                block=blocks[idx],
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb_img_silu=temb_img_silu,
-                temb_txt_silu=temb_txt_silu,
-                image_rotary_emb=image_rotary_emb,
-                modulate_index=modulate_index,
+        trace_path = os.environ.get("QWEN_MAGI_PROFILE_TRACE")
+        if trace_path:
+            return self._infer_calculating_profiled(
+                blocks,
+                hidden_states,
+                encoder_hidden_states,
+                temb_img_silu,
+                temb_txt_silu,
+                image_rotary_emb,
+                image_rotary_positions,
+                modulate_index,
+                trace_path,
+            )
+
+        for block_idx, block in enumerate(blocks):
+            encoder_hidden_states, hidden_states = self.run_block(
+                block_idx,
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                temb_img_silu,
+                temb_txt_silu,
+                image_rotary_emb,
+                image_rotary_positions,
+                modulate_index,
             )
         return hidden_states
+
+    if magi_compile is not None:
+
+        def _magi_config_patch(c):
+            return c.model_copy(
+                update={
+                    "enable_inductor_max_autotune": False,
+                    "disable_cache": True,
+                }
+            )
+
+        @magi_compile(
+            dynamic_arg_dims={
+                "hidden_states": 0,
+                "encoder_hidden_states": 0,
+                "img_freqs": 0,
+                "txt_freqs": 0,
+                "img_positions": 0,
+                "txt_positions": 0,
+                "modulate_index": 1,
+            },
+            config_patch=_magi_config_patch,
+        )
+        def infer_block_pre_attn_magi(
+            self,
+            img_attn_phase,
+            txt_attn_phase,
+            hidden_states,
+            encoder_hidden_states,
+            temb_img_silu,
+            temb_txt_silu,
+            img_freqs,
+            txt_freqs,
+            img_positions,
+            txt_positions,
+            modulate_index=None,
+        ):
+            return self.infer_block_pre_attn(
+                img_attn_phase,
+                txt_attn_phase,
+                hidden_states,
+                encoder_hidden_states,
+                temb_img_silu,
+                temb_txt_silu,
+                img_freqs,
+                txt_freqs,
+                img_positions,
+                txt_positions,
+                modulate_index,
+            )
+
+        @magi_compile(
+            dynamic_arg_dims={
+                "hidden_states": 0,
+                "encoder_hidden_states": 0,
+                "modulate_index": 1,
+            },
+            config_patch=_magi_config_patch,
+        )
+        def infer_block_post_attn_magi(
+            self,
+            ffn_phase,
+            hidden_states,
+            encoder_hidden_states,
+            img_mod2,
+            txt_mod2,
+            modulate_index=None,
+        ):
+            return self.infer_block_post_attn(
+                ffn_phase,
+                hidden_states,
+                encoder_hidden_states,
+                img_mod2,
+                txt_mod2,
+                modulate_index,
+            )
 
     def infer(self, block_weights, pre_infer_out):
         hidden_states = pre_infer_out.hidden_states
@@ -357,13 +545,14 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         temb_img_silu = pre_infer_out.temb_img_silu
         temb_txt_silu = pre_infer_out.temb_txt_silu
         image_rotary_emb = pre_infer_out.image_rotary_emb
-        hidden_states = self.infer_func(
+        image_rotary_positions = pre_infer_out.image_rotary_positions
+        return self.infer_func(
             block_weights.blocks,
             hidden_states,
             encoder_hidden_states,
             temb_img_silu,
             temb_txt_silu,
             image_rotary_emb,
+            image_rotary_positions,
             self.scheduler.modulate_index,
         )
-        return hidden_states

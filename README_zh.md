@@ -7,7 +7,6 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ModelTC/lightx2v)
 [![Doc](https://img.shields.io/badge/docs-English-99cc2)](https://lightx2v-en.readthedocs.io/en/latest)
 [![Doc](https://img.shields.io/badge/文档-中文-99cc2)](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest)
-[![Papers](https://img.shields.io/badge/论文集-中文-99cc2)](https://lightx2v-papers-zhcn.readthedocs.io/zh-cn/latest)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/lightx2v/lightx2v/tags)
 
 **\[ [English](README.md) | 中文 \]**
@@ -18,11 +17,15 @@
 
 **LightX2V** 是一个先进的轻量级图像视频生成推理框架，专为提供高效、高性能的图像视频生成解决方案而设计。该统一平台集成了多种前沿的图像视频生成技术，支持文本生成视频(T2V)和图像生成视频(I2V)，文本生图片(T2I)，图像编辑(I2I)等多样化生成任务。**X2V 表示将不同的输入模态(X，如文本或图像)转换为视觉输出(Vision)**。
 
-> 🌐 **立即在线体验！** 无需安装即可体验 LightX2V：**[LightX2V 在线服务](https://x2v.light-ai.top/login)** - 免费、轻量、快速的AI数字人视频生成平台。
+> 🌐 **立即在线体验！** 无需安装即可体验 LightX2V：**[LightX2V Studio](https://x2v.light-ai.top/)** - 免费、轻量、快速的AI视频生成平台，提供 Minimax H3 / Wan 2.2 / SekoTalk / Qwen-Image / SwiftVR 等多个模型多种任务的免费体验使用。
+
+> 🤗 **HuggingFace 模型仓库: [LightX2V HuggingFace](https://huggingface.co/lightx2v)**
+
+> 📝 **更多内容请访问我们的 [LightX2V 博客](https://light-ai.top/LightX2V-BLOG/)**
+
+> 🌟 **开发者新手入门教程: [LightX2V 开发者快速入门教程](https://github.com/ModelTC/LightX2V/tree/main/examples/BeginnerGuide)**
 
 > 👋 **加入微信交流群，LightX2V加群机器人微信号: random42seed**
-
-> 🌐 更多内容请访问我们的 [LightX2V 博客](https://light-ai.top/LightX2V-BLOG/)
 
 ## 🧾 社区代码贡献指南
 
@@ -42,8 +45,29 @@ pre-commit run --all-files
 - [kikidouloveme79](https://github.com/kikidouloveme79)
 - [ziyanxzy](https://github.com/ziyanxzy)
 - [Tyr0727](https://github.com/Tyr0727)
+- [hufangjian2017](https://github.com/hufangjian2017)
+- [Fatemanx](https://github.com/Fatemanx)
+- [qiuxin2012](https://github.com/qiuxin2012)
 
 ## :fire: 最新动态
+
+- **2026年8月27日：** 🚀 我们发布了 [MiniMax-H3 Turbo 8-step v1.0 768p 蒸馏 LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/main/minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors)，用于通过 MiniMax-H3 快速生成 768p 音视频，并带来更高的视频与音频质量。
+
+- **2026年8月11日：** 🚀 我们发布并支持 [MiniMax-H3 Turbo 4-step v1.0 768p 蒸馏 LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/main/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors)。`configs/minimax_h3/dmd` 下的推理配置默认以 1344x768 分辨率运行 H3，使用 `video_flow_shift=6`、`audio_flow_shift=3`、LoRA alpha 128，并支持 4 步无 CFG 推理。
+
+- **2026年8月7日：** 🚀 LightX2V 正式推出对 [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) 的完整推理支持。MiniMax-H3 是一款可生成原生同步立体声音频与视频的全模态生成模型；当前集成覆盖 T2AV、I2AV、L2AV、FL2AV 和 Ref2AV 工作流，并提供模型级与 Block 级 Offload、张量并行与序列并行、DiT 量化推理及特征缓存等优化能力。单卡与多卡示例请参阅 [MiniMax-H3 推理脚本](scripts/minimax_h3)。与此同时，我们发布了基于 Qwen3.6-27B 微调的 [MiniMax-H3 T2VA Prompt Rewriter LoRA](https://huggingface.co/lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA)，可将简洁的用户提示词转换为面向 H3 的结构化多模态描述，涵盖视觉叙事、整体音景与非叙事音乐。
+
+- **2026年7月28日：** 🚀 我们发布了 LingBot-Video 的 4 步蒸馏 LoRA：[LightLingBot-Video](https://huggingface.co/lightx2v/LightLingBot-Video)。该 LoRA 支持 T2V、T2I 和 I2V 任务，只需 4 步且无需 CFG 即可完成推理。使用方式请参考 [LingBot-Video 推理脚本](scripts/lingbot_video)。
+
+- **2026年7月23日：** 🎉 我们发布 [LightX2V ROS: Closing the Loop for Action-Generating World Models](https://light-ai.top/LightX2V-BLOG/posts/LightX2V_ROS/) 博客
+
+- **2026年7月19日：** ⚡️ 我们发布 [Wan2.2-NVFP4-Sparse: Extremely Fast Wan 2.2 14B Inference](https://light-ai.top/LightX2V-BLOG/posts/Wan22-NVFP4-Sparse/) 博客
+
+- **2026年6月15日：** 🚀 支持 平头哥 PPU 的部署。
+
+- **2026年5月29日：** 🚀 我们推出了一个极其高效的 Wan 2.2 14B 变体 (T2V and I2V)：[面向 Blackwell 架构的 NVFP4 量化感知步数蒸馏与稀疏注意力模型](https://huggingface.co/lightx2v/Wan2.2-NVFP4-Sparse)。在单张 RTX 5090 显卡上可实现超过 50 倍的加速。
+
+- **2026年4月30日：** 🚀 支持 天数智芯 的部署，感谢天数智芯团队。
 
 - **2026年4月20日：** 🚀 我们很高兴发布 [Wan2.2-I2V-A14B-4step-720p-high](https://huggingface.co/lightx2v/Wan2.2-Distill-Models/blob/main/wan2.2_i2v_A14b_high_noise_lightx2v_4step_720p_260412.safetensors) 和 [Wan2.2-I2V-A14B-4step-720p-low](https://huggingface.co/lightx2v/Wan2.2-Distill-Models/blob/main/wan2.2_i2v_A14b_low_noise_lightx2v_4step_720p_260412.safetensors) 两个新模型。与之前的版本相比，这一版本基于高质量的720p数据集进行训练，并采用了优化过的低噪声训练算法。这些改进显著提升了模型在细粒度细节渲染以及视觉纹理方面的表现。
 
@@ -152,62 +176,40 @@ uv pip install -v . # pip install -v .
 注意力算子安装说明请参考我们的文档：**[英文文档](https://lightx2v-en.readthedocs.io/en/latest/getting_started/quickstart.html#step-4-install-attention-operators) | [中文文档](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/getting_started/quickstart.html#id9)**
 
 ### 使用示例
+
+权重目录、本地 LoRA 路径、CLI 配置及服务与 POST 示例见 [MiniMax-H3 使用说明](scripts/minimax_h3/README_zh.md)。
+
 ```python
-# examples/wan/wan_i2v.py
+# examples/minimax_h3/minimax_h3_t2av_dmd.py
 """
-Wan2.2 image-to-video generation example.
-This example demonstrates how to use LightX2V with Wan2.2 model for I2V generation.
+使用 4 步 768p 蒸馏 LoRA 进行 MiniMax-H3 T2AV 生成。
 """
 
 from lightx2v import LightX2VPipeline
 
-# Initialize pipeline for Wan2.2 I2V task
-# For wan2.1, use model_cls="wan2.1"
+# 初始化 MiniMax-H3 T2AV pipeline。
 pipe = LightX2VPipeline(
-    model_path="/path/to/Wan2.2-I2V-A14B",
-    model_cls="wan2.2_moe",
-    task="i2v",
+    model_path="/path/to/MiniMax-H3",
+    model_cls="minimax_h3",
+    model_variant="fl2av",
 )
 
-# Alternative: create generator from config JSON file
-# pipe.create_generator(
-#     config_json="configs/wan22/wan_moe_i2v.json"
-# )
-
-# Enable offloading to significantly reduce VRAM usage with minimal speed impact
-# Suitable for RTX 30/40/50 consumer GPUs
-pipe.enable_offload(
-    cpu_offload=True,
-    offload_granularity="block",  # For Wan models, supports both "block" and "phase"
-    text_encoder_offload=True,
-    image_encoder_offload=False,
-    vae_offload=False,
-)
-
-# Create generator manually with specified parameters
+# DMD 配置使用已发布的 768p LoRA、4 步推理、
+# video_flow_shift=6、audio_flow_shift=3 和 LoRA alpha=128。
 pipe.create_generator(
-    attn_mode="sage_attn2",
-    infer_steps=40,
-    height=480,  # Can be set to 720 for higher resolution
-    width=832,  # Can be set to 1280 for higher resolution
-    num_frames=81,
-    guidance_scale=[3.5, 3.5],  # For wan2.1, guidance_scale is a scalar (e.g., 5.0)
-    sample_shift=5.0,
+    config_json="configs/minimax_h3/dmd/minimax_h3_bf16_4step.json"
 )
 
-# Generation parameters
+# 生成参数
 seed = 42
-prompt = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
-negative_prompt = "镜头晃动，色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-image_path="/path/to/img_0.jpg"
-save_result_path = "/path/to/save_results/output.mp4"
+prompt = "一只电影感狐狸穿过下雪的森林，轻柔的风声和远处鸟鸣构成沉浸式冬季音景。"
+save_result_path = "outputs/minimax_h3_t2av_768p.mp4"
 
-# Generate video
+# 生成带同步音频的视频
 pipe.generate(
+    task="t2av",
     seed=seed,
-    image_path=image_path,
     prompt=prompt,
-    negative_prompt=negative_prompt,
     save_result_path=save_result_path,
 )
 
@@ -222,15 +224,21 @@ pipe.generate(
 ## 🤖 支持的模型生态
 
 ### 官方开源模型
+- ✅ [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
+- ✅ [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)
 - ✅ [LTX-2](https://huggingface.co/Lightricks/LTX-2)
 - ✅ [HunyuanVideo-1.5](https://huggingface.co/tencent/HunyuanVideo-1.5)
 - ✅ [Wan2.1 & Wan2.2](https://huggingface.co/Wan-AI/)
+- ✅ [SeedVR2](https://huggingface.co/ByteDance-Seed/SeedVR2-3B)
+- ✅ [SwiftVR](https://huggingface.co/H-oliday/SwiftVR)；先使用 [convert_swiftvr.py](tools/convert/examples/convert_swiftvr.py) 转换权重，再运行 [图像或视频超分脚本](scripts/swiftvr/inference)。
 - ✅ [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image)
 - ✅ [Qwen-Image-Edit](https://huggingface.co/spaces/Qwen/Qwen-Image-Edit)
 - ✅ [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509)
 - ✅ [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
 
 ### 量化模型和蒸馏模型/Lora (**🚀 推荐：4步推理**)
+- ✅ [MiniMax-H3 Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo) —— 面向 MiniMax-H3 T2AV/FL2AV 的 4 步 768p 蒸馏 LoRA
+- ✅ [LightLingBot-Video](https://huggingface.co/lightx2v/LightLingBot-Video) —— 面向 LingBot-Video T2V、T2I 和 I2V 任务的 4 步蒸馏 LoRA
 - ✅ [Wan2.1-Distill-Models](https://huggingface.co/lightx2v/Wan2.1-Distill-Models)
 - ✅ [Wan2.2-Distill-Models](https://huggingface.co/lightx2v/Wan2.2-Distill-Models)
 - ✅ [Wan2.1-Distill-Loras](https://huggingface.co/lightx2v/Wan2.1-Distill-Loras)
@@ -242,7 +250,6 @@ pipe.generate(
 - ✅ [Autoencoders](https://huggingface.co/lightx2v/Autoencoders)
 
 ### 自回归模型
-- ✅ [Wan2.1-T2V-CausVid](https://huggingface.co/lightx2v/Wan2.1-T2V-14B-CausVid)
 - ✅ [Self-Forcing](https://github.com/guandeh17/Self-Forcing)
 - ✅ [Matrix-Game-2.0](https://huggingface.co/Skywork/Matrix-Game-2.0)
 
@@ -283,7 +290,6 @@ pipe.generate(
 - **🔄 并行推理加速**: 多GPU并行处理，显著提升性能表现
 - **📱 灵活部署选择**: 支持Gradio、服务化部署、ComfyUI等多种部署方式
 - **🎛️ 动态分辨率推理**: 自适应分辨率调整，优化生成质量
-- **🎞️ 视频帧插值**: 基于RIFE的帧插值技术，实现流畅的帧率提升
 
 
 ## 📚 技术文档
@@ -296,7 +302,6 @@ pipe.generate(
 - [并行推理](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/method_tutorials/parallel.html) - 多GPU加速策略
 - [变分辨率推理](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/method_tutorials/changing_resolution.html) - U型分辨率策略
 - [步数蒸馏](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/method_tutorials/step_distill.html) - 4步推理技术
-- [视频帧插值](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/method_tutorials/video_frame_interpolation.html) - 基于RIFE的帧插值技术
 
 ### 🛠️ **部署指南**
 - [低资源场景部署](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/for_low_resource.html) - 优化的8GB显存解决方案
@@ -313,6 +318,7 @@ pipe.generate(
 - [Tencent-Hunyuan](https://github.com/Tencent-Hunyuan)
 - [Wan-Video](https://github.com/Wan-Video)
 - [Qwen-Image](https://github.com/QwenLM/Qwen-Image)
+- [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
 - [LightLLM](https://github.com/ModelTC/LightLLM)
 - [sglang](https://github.com/sgl-project/sglang)
 - [vllm](https://github.com/vllm-project/vllm)
@@ -325,9 +331,11 @@ pipe.generate(
 - [FastVideo](https://github.com/hao-ai-lab/FastVideo)
 - [Mooncake](https://github.com/kvcache-ai/Mooncake)
 
-## 🌟 Star 历史
+同时感谢支持生态发展的云端推理平台：
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ModelTC/lightx2v&type=Timeline)](https://star-history.com/#ModelTC/lightx2v&Timeline)
+- [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=lightx2v) —— 全模态 AI 推理平台，其托管 API 提供 LightX2V 同样支持的 Wan / Seedance / Kling 等模型系列，适合希望使用托管 API 而非自建部署的团队。
+
+- [Sensecore](https://www.sensecore.cn/about) —— 商汤大装置，建设高效率、低成本、规模化的 AI 云基础设施，打造专业的深度学习平台及算法模型体系，引领AI创新，助力工业界及学术界探索 AI 边界。
 
 ## ✏️ 引用
 

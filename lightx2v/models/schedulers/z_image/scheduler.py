@@ -1,4 +1,3 @@
-import functools
 import inspect
 import json
 import math
@@ -10,7 +9,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
-from torch import nn
 from torch.nn import functional as F
 
 from lightx2v.models.schedulers.scheduler import BaseScheduler
@@ -215,104 +213,6 @@ def get_timestep_embedding(
     return emb
 
 
-class ZEmbedRope(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
-        pos_index = torch.arange(4096)
-        neg_index = torch.arange(4096).flip(0) * -1 - 1
-        self.pos_freqs = torch.cat(
-            [
-                self.rope_params(pos_index, self.axes_dim[0], self.theta),
-                self.rope_params(pos_index, self.axes_dim[1], self.theta),
-                self.rope_params(pos_index, self.axes_dim[2], self.theta),
-            ],
-            dim=1,
-        )
-        self.neg_freqs = torch.cat(
-            [
-                self.rope_params(neg_index, self.axes_dim[0], self.theta),
-                self.rope_params(neg_index, self.axes_dim[1], self.theta),
-                self.rope_params(neg_index, self.axes_dim[2], self.theta),
-            ],
-            dim=1,
-        )
-        self.rope_cache = {}
-
-        # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
-        self.scale_rope = scale_rope
-
-    def rope_params(self, index, dim, theta=10000):
-        """
-        Args:
-            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
-        """
-        assert dim % 2 == 0
-        freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
-        freqs = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs
-
-    def forward(self, video_fhw, txt_seq_lens, device):
-        """
-        Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
-        txt_length: [bs] a list of 1 integers representing the length of the text
-        """
-        if self.pos_freqs.device != device:
-            self.pos_freqs = self.pos_freqs.to(device)
-            self.neg_freqs = self.neg_freqs.to(device)
-
-        if isinstance(video_fhw, list):
-            video_fhw = video_fhw[0]
-        if not isinstance(video_fhw, list):
-            video_fhw = [video_fhw]
-
-        vid_freqs = []
-        max_vid_index = 0
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-
-            if not torch.compiler.is_compiling():
-                if rope_key not in self.rope_cache:
-                    self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
-                video_freq = self.rope_cache[rope_key]
-            else:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
-            video_freq = video_freq.to(device)
-            vid_freqs.append(video_freq)
-
-            if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
-            else:
-                max_vid_index = max(height, width, max_vid_index)
-
-        max_len = txt_seq_lens
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
-
-        return [vid_freqs, txt_freqs]
-
-    @functools.lru_cache(maxsize=None)
-    def _compute_video_freqs(self, frame, height, width, idx=0):
-        seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-
-        freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-        if self.scale_rope:
-            freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
-            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
-            freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
-            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-        else:
-            freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
-            freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
-
-        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-        return freqs.clone().contiguous()
-
-
 class RopeEmbedder:
     def __init__(
         self,
@@ -324,47 +224,45 @@ class RopeEmbedder:
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
         assert len(axes_dims) == len(axes_lens), "axes_dims and axes_lens must have the same length"
-        self.freqs_cis = None
+        self.freqs_cos_sin = None
 
     @staticmethod
-    def precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):
-        with torch.device("cpu"):
-            freqs_cis = []
-            for i, (d, e) in enumerate(zip(dim, end)):
-                # Compute base frequencies: [1/theta^0, 1/theta^(2/d), 1/theta^(4/d), ...]
-                freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d))
-                # Compute timestep positions: [0, 1, 2, ..., e-1]
-                timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
-                # Outer product: [e, d//2]
-                freqs = torch.outer(timestep, freqs).float()
-                # Convert to complex: polar(1, angle) = e^(i*angle)
-                freqs_cis_i = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
-                freqs_cis.append(freqs_cis_i)
-            return freqs_cis
+    def precompute_freqs_cos_sin(dim: List[int], end: List[int], theta: float = 256.0, device: torch.device = None):
+        freqs_cos_sin = []
+        for d, e in zip(dim, end):
+            freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+            timestep = torch.arange(e, device=device, dtype=torch.float32)
+            freqs = torch.outer(timestep, freqs)
+            freqs_cos_sin.append((freqs.cos(), freqs.sin()))
+        return freqs_cos_sin
 
-    def __call__(self, ids: torch.Tensor):
+    def __call__(self, ids: torch.Tensor, return_real: bool = False):
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
-        if self.freqs_cis is None:
-            self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
-        else:
-            if self.freqs_cis[0].device != device:
-                self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+        if self.freqs_cos_sin is None or self.freqs_cos_sin[0][0].device != device:
+            self.freqs_cos_sin = self.precompute_freqs_cos_sin(self.axes_dims, self.axes_lens, theta=self.theta, device=device)
 
-        result = []
-        for i in range(len(self.axes_dims)):
-            index = ids[:, i]
-            result.append(self.freqs_cis[i][index])
-        return torch.cat(result, dim=-1)
+        ids = ids.to(dtype=torch.long)
+        cos_result = []
+        sin_result = []
+        for i, (freqs_cos, freqs_sin) in enumerate(self.freqs_cos_sin):
+            cos_result.append(freqs_cos[ids[:, i]])
+            sin_result.append(freqs_sin[ids[:, i]])
+
+        freqs_cos = torch.cat(cos_result, dim=-1)
+        freqs_sin = torch.cat(sin_result, dim=-1)
+        if return_real:
+            return freqs_cos, freqs_sin
+        return torch.complex(freqs_cos, freqs_sin)
 
 
 class ZImageScheduler(BaseScheduler):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
+        self.generator = None
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(config["model_path"], "scheduler"))
         with open(os.path.join(config["model_path"], "scheduler", "scheduler_config.json"), "r") as f:
             self.scheduler_config = json.load(f)
@@ -375,8 +273,6 @@ class ZImageScheduler(BaseScheduler):
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
         else:
             self.seq_p_group = None
-        self.pos_embed = ZEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
-
         # Initialize RopeEmbedder for generating freqs_cis from position IDs (used in pre_infer)
         rope_theta = config.get("rope_theta", 256.0)
         axes_dims = config.get("axes_dims", [32, 48, 48])
@@ -386,6 +282,8 @@ class ZImageScheduler(BaseScheduler):
             axes_dims=axes_dims,
             axes_lens=axes_lens,
         )
+        self.freqs_cis_cache = {}
+        self.rope_request_id = 0
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels_latents, height, width):
@@ -411,18 +309,6 @@ class ZImageScheduler(BaseScheduler):
         return latents
 
     @staticmethod
-    def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
-        latent_image_ids = torch.zeros(height, width, 3)
-
-        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-
-        latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
-        latent_image_ids = latent_image_ids.reshape(latent_image_id_height * latent_image_id_width, latent_image_id_channels)
-
-        return latent_image_ids.to(device=device, dtype=dtype)
-
-    @staticmethod
     def create_coordinate_grid(size, start=None, device=None):
         """Create a 3D coordinate grid."""
         if start is None:
@@ -431,47 +317,97 @@ class ZImageScheduler(BaseScheduler):
         grids = torch.meshgrid(axes, indexing="ij")
         return torch.stack(grids, dim=-1)
 
+    def _get_i2i_denoise_strength(self, input_info):
+        strength = getattr(input_info, "i2i_denoise_strength", None)
+        if strength is None:
+            strength = self.config.get("i2i_denoise_strength")
+        if strength is None:
+            return None
+        strength = float(strength)
+        if strength < 0.0 or strength > 1.0:
+            raise ValueError(f"The value of i2i_denoise_strength should be in [0.0, 1.0] but is {strength}")
+        return strength
+
+    def _get_single_i2i_image_latents(self, input_info):
+        image_encoder_output = getattr(input_info, "image_encoder_output", None)
+        if not image_encoder_output:
+            raise ValueError("z-image i2i requires exactly one input image with VAE image latents.")
+        if len(image_encoder_output) != 1:
+            raise ValueError(f"z-image i2i currently supports single-image editing only, got {len(image_encoder_output)} images.")
+        return image_encoder_output[0]["image_latents"]
+
+    def get_timesteps(self, num_inference_steps, strength):
+        target_steps = round(num_inference_steps * strength)
+        if target_steps < 1:
+            raise ValueError(
+                "i2i_denoise_strength results in 0 denoising steps: "
+                f"round(infer_steps * i2i_denoise_strength)=round({num_inference_steps} * {strength})={target_steps}; "
+                "please increase it to run at least 1 step."
+            )
+        t_start = num_inference_steps - target_steps
+        timesteps = self.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        return timesteps, target_steps
+
+    def _resize_i2i_image_latents(self, image_latents, target_height, target_width, target_channels):
+        if image_latents.ndim != 4:
+            raise ValueError(f"Expected z-image i2i image latents with shape [B, C, H, W], got {tuple(image_latents.shape)}")
+        if image_latents.shape[1] != target_channels:
+            raise ValueError(f"z-image i2i image latent channels {image_latents.shape[1]} do not match target channels {target_channels}.")
+        if image_latents.shape[-2:] != (target_height, target_width):
+            image_latents = F.interpolate(image_latents, size=(target_height, target_width), mode="bilinear", align_corners=False)
+        return image_latents
+
+    def prepare_i2i_denoise_strength_latents(self, input_info):
+        image_latents = self._get_single_i2i_image_latents(input_info).to(device=AI_DEVICE, dtype=self.dtype)
+        if self.latents.shape[0] != 1:
+            raise ValueError(f"z-image i2i currently supports single-image single-output editing only, got output latent batch {self.latents.shape[0]}.")
+
+        _, target_channels, target_height, target_width = self.latents.shape
+        image_latents = self._resize_i2i_image_latents(image_latents, target_height, target_width, target_channels)
+
+        latent_timestep = self.timesteps[:1]
+        noise = self.latents
+        self.latents = self.scheduler.scale_noise(image_latents, latent_timestep, noise)
+
     def prepare_latents(self, input_info):
         self.input_info = input_info
-        shape = input_info.target_shape
+        shape = input_info.latent_shape
 
         if len(shape) != 4:
-            raise ValueError(f"target_shape must be 4D [B, C, H, W], got {len(shape)}D: {shape}")
-
-        batch_size, num_channels, height, width = shape
+            raise ValueError(f"latent_shape must be 4D [B, C, H, W], got {len(shape)}D: {shape}")
 
         latents = randn_tensor(shape, generator=self.generator, device=AI_DEVICE, dtype=self.dtype)
 
-        latent_image_ids = self._prepare_latent_image_ids(1, height // 2, width // 2, AI_DEVICE, self.dtype)
-
         self.latents = latents
-        self.latent_image_ids = latent_image_ids
         self.noise_pred = None
 
     def generate_freqs_cis_from_position_ids(self, position_ids: torch.Tensor, device: torch.device = None) -> torch.Tensor:
         if device is None:
             device = position_ids.device
 
-        freqs_cis = self.rope_embedder(position_ids.to(device))
-        rope_type = self.config.get("rope_type", "flashinfer")
-        if rope_type == "flashinfer":
-            freqs_cis = torch.cat([freqs_cis.real, freqs_cis.imag], dim=-1).float()
+        position_ids = position_ids.to(device)
+        cache_key = (
+            str(device),
+            str(position_ids.dtype),
+            tuple(position_ids.shape),
+            tuple(position_ids[0].tolist()),
+            tuple(position_ids[-1].tolist()),
+        )
+        cached_freqs_cis = self.freqs_cis_cache.get(cache_key)
+        if cached_freqs_cis is not None:
+            return cached_freqs_cis
 
+        freqs_cis = self.rope_embedder(position_ids)
+
+        self.freqs_cis_cache[cache_key] = freqs_cis
         return freqs_cis
-
-    def get_timesteps(self, num_inference_steps, strength, device):
-        init_timestep = min(num_inference_steps * strength, num_inference_steps)
-
-        t_start = int(max(num_inference_steps - init_timestep, 0))
-        timesteps = self.timesteps[t_start * self.scheduler.order :]
-        if hasattr(self.scheduler, "set_begin_index"):
-            self.scheduler.set_begin_index(t_start * self.scheduler.order)
-
-        return timesteps, num_inference_steps - t_start
 
     def set_timesteps(self):
         sigmas = np.linspace(1.0, 1 / self.config["infer_steps"], self.config["infer_steps"])
-        image_seq_len = self.latents.shape[1]
+        _, _, latent_height, latent_width = self.latents.shape
+        image_seq_len = (latent_height // 2) * (latent_width // 2)
         mu = calculate_shift(
             image_seq_len,
             self.scheduler_config.get("base_image_seq_len", 256),
@@ -491,88 +427,27 @@ class ZImageScheduler(BaseScheduler):
         self.timesteps = timesteps
         self.infer_steps = num_inference_steps
 
-        # Adjust timesteps based on strength for i2i task
-        if self.config["task"] == "i2i" and hasattr(self.input_info, "strength"):
-            strength = getattr(self.input_info, "strength", 0.6)
-            if strength < 0.0 or strength > 1.0:
-                raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
-            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, AI_DEVICE)
-            if num_inference_steps < 1:
-                raise ValueError(
-                    f"After adjusting the num_inference_steps by strength parameter: {strength}, the number of pipeline "
-                    f"steps is {num_inference_steps} which is < 1 and not appropriate for this pipeline."
-                )
-            self.timesteps = timesteps
-            self.infer_steps = num_inference_steps
+        if self.config["task"] == "i2i":
+            strength = self._get_i2i_denoise_strength(self.input_info)
+            if strength is not None:
+                timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength)
+                self.timesteps = timesteps
+                self.infer_steps = num_inference_steps
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
         self.num_warmup_steps = num_warmup_steps
 
     def prepare(self, input_info):
+        self.rope_request_id += 1
+        self.freqs_cis_cache = {}
+
         self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
         self.prepare_latents(input_info)
         self.set_timesteps()
-
-        if self.config["task"] == "i2i" and hasattr(input_info, "image_encoder_output") and input_info.image_encoder_output is not None:
-            strength = getattr(input_info, "strength", 0.6)
-            if strength > 0.0:
-                image_latents_list = [item["image_latents"] for item in input_info.image_encoder_output]
-                if len(image_latents_list) > 0:
-                    image_latents = torch.cat(image_latents_list, dim=0) if len(image_latents_list) > 1 else image_latents_list[0]
-                    batch_size = self.latents.shape[0]
-                    if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
-                        additional_image_per_prompt = batch_size // image_latents.shape[0]
-                        image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
-                    elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
-                        raise ValueError(f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts.")
-
-                    _, _, height, width = self.latents.shape
-                    if image_latents.shape[2:] != (height, width):
-                        image_latents = F.interpolate(image_latents, size=(height, width), mode="bilinear", align_corners=False)
-                    latent_timestep = self.timesteps[:1].repeat(self.latents.shape[0])
-
-                    noise = randn_tensor(self.latents.shape, generator=self.generator, device=AI_DEVICE, dtype=self.dtype)
-                    if image_latents.shape[1] != self.latents.shape[1]:
-                        repeat_factor = self.latents.shape[1] // image_latents.shape[1]  # 64 // 16 = 4
-                        image_latents = image_latents.repeat(1, repeat_factor, 1, 1)
-                    self.latents = self.scheduler.scale_noise(image_latents, latent_timestep, noise)
-
-        self.image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[0], device=AI_DEVICE)
-
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            cos_half_img = self.image_rotary_emb[0].real.contiguous()
-            sin_half_img = self.image_rotary_emb[0].imag.contiguous()
-            cos_half_txt = self.image_rotary_emb[1].real.contiguous()
-            sin_half_txt = self.image_rotary_emb[1].imag.contiguous()
-            self.image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-            self.image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
-        if self.seq_p_group is not None:
-            world_size = dist.get_world_size(self.seq_p_group)
-            cur_rank = dist.get_rank(self.seq_p_group)
-            seqlen = self.image_rotary_emb[0].shape[0]
-            padding_size = (world_size - (seqlen % world_size)) % world_size
-            if padding_size > 0:
-                self.image_rotary_emb[0] = F.pad(self.image_rotary_emb[0], (0, 0, 0, padding_size))
-            self.image_rotary_emb[0] = torch.chunk(self.image_rotary_emb[0], world_size, dim=0)[cur_rank]
-
-        if self.config["enable_cfg"]:
-            self.negative_image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[1], device=AI_DEVICE)
-            if self.config.get("rope_type", "flashinfer") == "flashinfer":
-                cos_half_img = self.negative_image_rotary_emb[0].real.contiguous()
-                sin_half_img = self.negative_image_rotary_emb[0].imag.contiguous()
-                cos_half_txt = self.negative_image_rotary_emb[1].real.contiguous()
-                sin_half_txt = self.negative_image_rotary_emb[1].imag.contiguous()
-                self.negative_image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-                self.negative_image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = self.negative_image_rotary_emb[0].shape[0]
-                padding_size = (world_size - (seqlen % world_size)) % world_size
-                if padding_size > 0:
-                    self.negative_image_rotary_emb[0] = F.pad(self.negative_image_rotary_emb[0], (0, 0, 0, padding_size))
-                self.negative_image_rotary_emb[0] = torch.chunk(self.negative_image_rotary_emb[0], world_size, dim=0)[cur_rank]
+        strength = self._get_i2i_denoise_strength(input_info)
+        if self.config["task"] == "i2i" and strength is not None:
+            self.prepare_i2i_denoise_strength_latents(input_info)
 
         if self.zero_cond_t:
             self.modulate_index = torch.tensor([[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in self.input_info.image_shapes], device=AI_DEVICE, dtype=torch.int)

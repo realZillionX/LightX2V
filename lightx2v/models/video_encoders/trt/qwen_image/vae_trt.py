@@ -48,8 +48,10 @@ STATIC_RESOLUTIONS = {
     (928, 1664): "16_9",
     (1664, 928): "9_16",
     (1328, 1328): "1_1",
-    (1140, 1472): "4_3",
-    (1024, 768): "3_4",
+    (1104, 1472): "4_3",
+    (1472, 1104): "3_4",
+    (1584, 1056): "3_2",
+    (1056, 1584): "2_3",
 }
 
 
@@ -353,7 +355,7 @@ class TensorRTVAE:
     @torch.no_grad()
     def decode(self, latents, input_info):
         """Decode latents to image."""
-        width, height = input_info.auto_width, input_info.auto_height
+        height, width = input_info.size
         if self.is_layered:
             latents = self._unpack_latents(latents, height, width, self.config["vae_scale_factor"], self.layers)
         else:

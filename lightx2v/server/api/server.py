@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +14,8 @@ from ..services import DistributedInferenceService
 from ..task_manager import TaskStatus, task_manager
 from .deps import ServiceContainer, get_services
 from .router import create_api_router
+
+TASK_PROCESSING_IDLE_WAIT_TIMEOUT_SECONDS = 0.2
 
 
 class ApiServer:
@@ -85,10 +88,9 @@ class ApiServer:
         loop = asyncio.get_event_loop()
 
         while not self.stop_processing.is_set():
-            task_id = task_manager.get_next_pending_task()
+            task_id = task_manager.wait_for_next_pending_task(timeout=TASK_PROCESSING_IDLE_WAIT_TIMEOUT_SECONDS)
 
             if task_id is None:
-                time.sleep(1)
                 continue
 
             task_info = task_manager.get_task(task_id)
@@ -112,6 +114,8 @@ class ApiServer:
             return
 
         try:
+            pending_elapsed_ms = (datetime.now() - task_info.start_time).total_seconds() * 1000
+            logger.info(f"Task {task_id} scheduler pending wait {pending_elapsed_ms:.2f} ms")
             task_manager.start_task(task_id)
 
             if task_info.stop_event.is_set():
@@ -119,12 +123,17 @@ class ApiServer:
                 task_manager.fail_task(task_id, "Task cancelled")
                 return
 
-            from ..schema import ImageTaskRequest
+            from ..schema import ImageTaskRequest, SenseNovaVisionTaskRequest
 
-            if isinstance(message, ImageTaskRequest):
+            if isinstance(message, SenseNovaVisionTaskRequest):
+                generation_service = services.sensenova_vision_service
+            elif isinstance(message, ImageTaskRequest):
                 generation_service = services.image_service
             else:
                 generation_service = services.video_service
+
+            if generation_service is None:
+                raise RuntimeError(f"Generation service is not initialized for request type {type(message)!r}")
 
             result = await generation_service.generate_with_stop_event(message, task_info.stop_event)
 
@@ -133,6 +142,8 @@ class ApiServer:
                     task_id,
                     save_result_path=result.save_result_path or None,
                     result_png=getattr(result, "result_png", None),
+                    usage=getattr(result, "usage", None),
+                    result_data=getattr(result, "result_data", None),
                 )
                 logger.info(f"Task {task_id} completed successfully")
             else:
@@ -145,7 +156,8 @@ class ApiServer:
 
         except Exception as e:
             logger.exception(f"Task {task_id} processing failed: {str(e)}")
-            task_manager.fail_task(task_id, str(e))
+            original_et = getattr(e, "original_error_type", "") or ""
+            task_manager.fail_task(task_id, str(e), error_type=original_et or None)
         finally:
             if lock_acquired:
                 task_manager.release_processing_lock(task_id)
